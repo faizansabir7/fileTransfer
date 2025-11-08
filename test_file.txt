@@ -1,0 +1,12 @@
+This is a test file for the Local File Share application.
+
+You can drag and drop this file on your Mac to test the file sharing functionality.
+
+The file should appear on your iPhone when you connect to the host.
+
+Test data:
+- File name: test_file.txt
+- Content: Plain text
+- Size: Small (for quick testing)
+
+Happy file sharing!

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local File Share</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#4CAF50">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Local File Share</h1>
+            <p>Share files without internet - Local Network Only</p>
+        </header>
+
+        <div class="network-info">
+            <div class="info-card">
+                <h3>Network Status</h3>
+                <div id="networkStatus">Checking connection...</div>
+                <div id="serverUrl" class="server-url"></div>
+            </div>
+        </div>
+
+        <div class="mode-selector">
+            <button id="hostBtn" class="mode-btn active">
+                <span class="icon">📡</span>
+                <span>Host Files</span>
+                <small>Share files from this device</small>
+            </button>
+            <button id="clientBtn" class="mode-btn">
+                <span class="icon">📱</span>
+                <span>Connect to Host</span>
+                <small>Receive files from another device</small>
+            </button>
+        </div>
+
+        <!-- Host Mode -->
+        <div id="hostMode" class="mode-content active">
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📁</div>
+                <div class="upload-text">
+                    <h3>Drop files here or click to select</h3>
+                    <p>Share files with other devices on your network</p>
+                </div>
+                <input type="file" id="fileInput" multiple>
+            </div>
+
+            <div id="fileList" class="file-list"></div>
+
+            <div class="share-info" id="shareInfo" style="display: none;">
+                <h3>Share this URL with other devices:</h3>
+                <div class="url-display">
+                    <input type="text" id="shareUrl" readonly>
+                    <button id="copyBtn">📋 Copy</button>
+                </div>
+                <div class="qr-code" id="qrCode"></div>
+            </div>
+        </div>
+
+        <!-- Client Mode -->
+        <div id="clientMode" class="mode-content">
+            <div class="connect-form">
+                <h3>Connect to a Host</h3>
+                <div class="input-group">
+                    <input type="text" id="hostUrl" placeholder="Enter host URL or IP address">
+                    <button id="connectBtn">Connect</button>
+                </div>
+                <div class="scan-option">
+                    <button id="scanBtn">📷 Scan QR Code</button>
+                </div>
+            </div>
+
+            <div id="connectionStatus" class="status-message"></div>
+            
+            <div id="availableFiles" class="available-files"></div>
+        </div>
+
+        <!-- Download Progress -->
+        <div id="downloadProgress" class="progress-container" style="display: none;">
+            <h3>Download Progress</h3>
+            <div class="progress-list" id="progressList"></div>
+        </div>
+    </div>
+
+    <!-- Camera Modal for QR Scanning -->
+    <div id="cameraModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3>Scan QR Code</h3>
+            <video id="cameraVideo" autoplay></video>
+            <canvas id="qrCanvas" style="display: none;"></canvas>
+        </div>
+    </div>
+
+    <script src="qrcode.min.js"></script>
+    <script src="jsqr.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

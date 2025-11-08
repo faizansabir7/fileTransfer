@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>File Share Debug Test</title>
+</head>
+<body>
+    <h1>Debug Test Page</h1>
+    
+    <h2>Server Tests:</h2>
+    <button onclick="testServerConnection()">Test Server Connection</button>
+    <button onclick="testFileList()">Test File List API</button>
+    <button onclick="testFileUpload()">Test File Upload</button>
+    
+    <div id="results" style="margin-top: 20px; padding: 10px; background: #f0f0f0; white-space: pre-wrap;"></div>
+    
+    <script>
+        const log = (message) => {
+            const results = document.getElementById('results');
+            results.textContent += new Date().toLocaleTimeString() + ': ' + message + '\n';
+        };
+        
+        async function testServerConnection() {
+            log('Testing server connection...');
+            try {
+                const response = await fetch('/');
+                log(`Server response: ${response.status} ${response.statusText}`);
+                log('✅ Server is responding');
+            } catch (error) {
+                log(`❌ Server connection failed: ${error.message}`);
+            }
+        }
+        
+        async function testFileList() {
+            log('Testing file list API...');
+            try {
+                const response = await fetch('/api/files');
+                const data = await response.json();
+                log(`File list response: ${JSON.stringify(data, null, 2)}`);
+                log(`Number of files: ${data.files ? data.files.length : 0}`);
+            } catch (error) {
+                log(`❌ File list API failed: ${error.message}`);
+            }
+        }
+        
+        async function testFileUpload() {
+            log('Testing file upload...');
+            try {
+                // Create a test file
+                const testContent = 'Test file content for debugging';
+                const testFile = new File([testContent], 'debug_test.txt', { type: 'text/plain' });
+                
+                const formData = new FormData();
+                formData.append('file', testFile);
+                formData.append('fileId', 'debug-' + Date.now());
+                
+                log('Sending upload request...');
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                log(`Upload response: ${response.status} ${response.statusText}`);
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    log(`✅ Upload successful: ${JSON.stringify(result)}`);
+                    
+                    // Test file list again
+                    setTimeout(testFileList, 1000);
+                } else {
+                    const errorText = await response.text();
+                    log(`❌ Upload failed: ${errorText}`);
+                }
+            } catch (error) {
+                log(`❌ Upload error: ${error.message}`);
+            }
+        }
+    </script>
+</body>
+</html>
