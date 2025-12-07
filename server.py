@@ -49,6 +49,15 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_file_removal()
         else:
             self.send_error(404)
+    
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Range')
+        self.send_header('Access-Control-Max-Age', '86400')  # 24 hours
+        self.end_headers()
 
     def handle_file_list(self):
         """Return list of shared files"""
@@ -283,7 +292,14 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         try:
             print(f"[UPLOAD] Received upload request")
             
-            content_length = int(self.headers['Content-Length'])
+            # Check if Content-Length header exists
+            content_length_header = self.headers.get('Content-Length')
+            if not content_length_header:
+                print(f"[UPLOAD] ERROR: Missing Content-Length header")
+                self.send_error(400, "Missing Content-Length header")
+                return
+            
+            content_length = int(content_length_header)
             content_type = self.headers.get('Content-Type', '')
             
             print(f"[UPLOAD] Content-Length: {self.formatFileSize(content_length)}")
@@ -507,6 +523,8 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(json_data)))
         self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
         self.wfile.write(json_data)
 
