@@ -21,6 +21,17 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
+    // Don't intercept blob URLs (needed for downloads)
+    if (event.request.url.startsWith('blob:')) {
+        return;
+    }
+    
+    // Don't intercept download requests
+    if (event.request.url.includes('download') || 
+        event.request.destination === 'download') {
+        return;
+    }
+    
     event.respondWith(
         caches.match(event.request)
             .then((response) => {
