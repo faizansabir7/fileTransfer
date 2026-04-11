@@ -6,16 +6,23 @@ class LocalFileShare {
         this.dataChannels = new Map(); // Map of peerId -> RTCDataChannel
         this.serverUrl = '';
         this.currentHostUrl = null;
-        this.peerId = null; // Will be set in switchMode() based on host/client mode
+        this.peerId = null; // Set after registration (host) or on mode switch (client)
         this.signalingPollInterval = null;
         this.isPolling = false;
 
+        // Host-mode state
+        this.hostId = null;             // Set after register-host
+        this.heartbeatInterval = null;  // Keeps host alive in server registry
+
+        // Client-mode state
+        this.currentTargetHostId = null; // hostId of the host we're connected to
+
         // File transfer state
         this.transfers = new Map(); // Map of transferId -> {chunks, received, total, fileName}
-        
+
         // Keep-alive intervals for connections
         this.keepAliveIntervals = new Map(); // Map of peerId -> interval
-        
+
         // Reconnection state
         this.reconnecting = new Set(); // Set of peerIds currently reconnecting
 
@@ -39,7 +46,17 @@ class LocalFileShare {
         document.getElementById('hostBtn').addEventListener('click', () => this.switchMode(true));
         document.getElementById('clientBtn').addEventListener('click', () => this.switchMode(false));
 
-        // File upload
+        // Host name setup
+        document.getElementById('startHostingBtn').addEventListener('click', () => this.startHosting());
+        document.getElementById('hostName').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') this.startHosting();
+        });
+        document.getElementById('hostName').addEventListener('input', () => {
+            this.setHostSetupStatus('', '');
+        });
+        document.getElementById('stopHostingBtn').addEventListener('click', () => this.stopHosting());
+
+        // File upload (inside hostingActive section)
         const fileInput = document.getElementById('fileInput');
         const uploadArea = document.getElementById('uploadArea');
 
@@ -63,7 +80,7 @@ class LocalFileShare {
         // Copy URL button
         document.getElementById('copyBtn').addEventListener('click', () => this.copyShareUrl());
 
-        // Connect button
+        // Connect button (manual form)
         document.getElementById('connectBtn').addEventListener('click', () => this.connectToHost());
 
         // QR Scanner
@@ -73,6 +90,18 @@ class LocalFileShare {
         // P2P Reset button
         document.getElementById('resetP2PBtn').addEventListener('click', () => this.resetP2PConnection());
 
+        // Host discovery
+        document.getElementById('refreshHostsBtn').addEventListener('click', () => this.discoverHosts());
+
+        // Toggle manual connect form
+        document.getElementById('toggleManualBtn').addEventListener('click', () => {
+            const form = document.getElementById('manualConnectForm');
+            const btn = document.getElementById('toggleManualBtn');
+            const isHidden = form.style.display === 'none' || form.style.display === '';
+            form.style.display = isHidden ? 'block' : 'none';
+            btn.textContent = isHidden ? 'Hide manual connect' : 'Enter URL manually';
+        });
+
         // Service Worker for offline functionality
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('sw.js').catch(console.error);
@@ -80,14 +109,17 @@ class LocalFileShare {
     }
 
     switchMode(isHost) {
+        // If leaving host mode, deregister
+        if (!isHost && this.isHost && this.hostId) {
+            this.stopHosting();
+        }
+
         this.isHost = isHost;
 
-        // Set peer ID based on mode
-        if (isHost) {
-            this.peerId = 'host'; // Fixed peer ID for hosts
-        } else {
-            this.peerId = this.generatePeerId(); // Random peer ID for clients
+        if (!isHost) {
+            this.peerId = this.generatePeerId();
         }
+        // Host peerId is set later by startHosting() after server registration
 
         // Update UI
         document.getElementById('hostBtn').classList.toggle('active', isHost);
@@ -104,50 +136,201 @@ class LocalFileShare {
 
     async detectNetworkInfo() {
         try {
-            // First try to get network info from the server
             const response = await fetch('/api/network-info');
             const data = await response.json();
-            this.serverUrl = data.server_url;
+            // Prefer HTTPS URL — required for WebRTC in Safari/iOS
+            this.serverUrl = data.https_url || data.server_url;
+            this.httpsUrl  = data.https_url || null;
             this.updateNetworkStatus('Connected to local network', 'success');
-            console.log('[Network] Server URL:', this.serverUrl);
+            console.log('[Network] Server URL:', this.serverUrl, '| HTTPS:', this.httpsUrl);
         } catch (error) {
             console.error('[Network] Error detecting network info:', error);
             this.updateNetworkStatus('Network detection failed - using localhost', 'error');
-            this.serverUrl = `http://localhost:8080`;
+            this.serverUrl = 'http://localhost:8080';
+            this.httpsUrl  = null;
         }
     }
 
     updateNetworkStatus(message, type = 'info') {
         const statusEl = document.getElementById('networkStatus');
-        const urlEl = document.getElementById('serverUrl');
+        const urlEl    = document.getElementById('serverUrl');
 
         statusEl.textContent = message;
         statusEl.className = `status-message ${type}`;
 
         if (this.serverUrl) {
-            urlEl.textContent = `Server URL: ${this.serverUrl}`;
+            let text = `Share URL: ${this.serverUrl}`;
+            if (this.httpsUrl) {
+                text += ' (HTTPS — required for Safari)';
+            }
+            urlEl.textContent = text;
         }
     }
 
     async startHostMode() {
-        try {
-            console.log('[P2P] Starting host mode as:', this.peerId);
-            this.updateNetworkStatus('Server running - Ready to share files', 'success');
-            this.updateShareInfo();
+        // Show name setup; don't start signaling until user clicks "Start Hosting"
+        document.getElementById('hostNameSetup').style.display = 'block';
+        document.getElementById('hostingActive').style.display = 'none';
+        this.updateNetworkStatus('Enter your name to start hosting', 'info');
 
-            // Start listening for P2P connection requests
+        // Pre-fill saved name if available
+        const saved = localStorage.getItem('hostName');
+        if (saved) document.getElementById('hostName').value = saved;
+    }
+
+    setHostSetupStatus(msg, type = 'info') {
+        const el = document.getElementById('hostSetupStatus');
+        if (el) { el.textContent = msg; el.className = `setup-status ${type}`; }
+    }
+
+    async startHosting() {
+        const nameInput = document.getElementById('hostName');
+        const btn = document.getElementById('startHostingBtn');
+        const name = nameInput.value.trim();
+
+        if (!name) {
+            nameInput.focus();
+            this.setHostSetupStatus('Please enter a name first.', 'error');
+            return;
+        }
+
+        // Show loading state
+        btn.disabled = true;
+        btn.textContent = 'Starting...';
+        this.setHostSetupStatus('Registering with server...', 'info');
+
+        try {
+            const res = await fetch('/api/register-host', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name})
+            });
+
+            if (!res.ok) {
+                throw new Error(`Server returned ${res.status} — make sure you restarted the server`);
+            }
+
+            const data = await res.json();
+
+            if (!data.hostId) {
+                throw new Error('Server did not return a host ID');
+            }
+
+            this.hostId = data.hostId;
+            this.peerId = data.hostId;
+            localStorage.setItem('hostName', name);
+
+            // Show hosting-active section
+            document.getElementById('hostNameSetup').style.display = 'none';
+            document.getElementById('hostingActive').style.display = 'block';
+            document.getElementById('hostingNameDisplay').textContent = name;
+
+            this.updateNetworkStatus(`Hosting as "${name}"`, 'success');
+            this.updateShareInfo();
             this.startSignalingPoll();
-        } catch (error) {
-            console.error('Failed to start host mode:', error);
-            this.updateNetworkStatus('Failed to start server', 'error');
+            this.startHeartbeat();
+
+        } catch (err) {
+            this.setHostSetupStatus(`Error: ${err.message}`, 'error');
+            btn.disabled = false;
+            btn.textContent = 'Start Hosting';
+        }
+    }
+
+    stopHosting() {
+        if (this.hostId) {
+            fetch(`/api/deregister-host/${this.hostId}`, {method: 'DELETE'}).catch(() => {});
+            this.hostId = null;
+        }
+        this.peerId = null;
+        this.stopSignalingPoll();
+        this.stopHeartbeat();
+
+        // Reset host UI
+        document.getElementById('hostingActive').style.display = 'none';
+        document.getElementById('hostNameSetup').style.display = 'block';
+        document.getElementById('fileList').innerHTML = '';
+        document.getElementById('shareInfo').style.display = 'none';
+        this.files.clear();
+        this.updateNetworkStatus('Enter your name to start hosting', 'info');
+    }
+
+    startHeartbeat() {
+        this.stopHeartbeat();
+        this.heartbeatInterval = setInterval(() => {
+            if (this.hostId) {
+                fetch('/api/heartbeat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({hostId: this.hostId})
+                }).catch(() => {});
+            }
+        }, 15000);
+    }
+
+    stopHeartbeat() {
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
         }
     }
 
     startClientMode() {
         this.stopSignalingPoll();
+        this.currentTargetHostId = null;
         this.updateNetworkStatus('Ready to connect to a host', 'info');
         document.getElementById('connectionStatus').innerHTML = '';
         document.getElementById('availableFiles').innerHTML = '';
+        document.getElementById('p2pControls').style.display = 'none';
+        this.discoverHosts();
+    }
+
+    async discoverHosts() {
+        const hostsList = document.getElementById('hostsList');
+        if (!hostsList) return;
+
+        hostsList.innerHTML = '<div class="discovering">Searching for hosts...</div>';
+
+        try {
+            const response = await fetch('/api/hosts');
+            if (!response.ok) throw new Error('Failed to fetch hosts');
+            const data = await response.json();
+
+            hostsList.innerHTML = '';
+
+            if (!data.hosts || data.hosts.length === 0) {
+                hostsList.innerHTML = '<div class="no-hosts">No hosts found. Switch another device to Host mode first.</div>';
+                return;
+            }
+
+            data.hosts.forEach(hostInfo => {
+                const card = document.createElement('div');
+                card.className = 'host-card';
+                const fileLabel = hostInfo.files_count === 1 ? '1 file' : `${hostInfo.files_count} files`;
+                card.innerHTML = `
+                    <div class="host-status-dot"></div>
+                    <div class="host-card-info">
+                        <div class="host-name">${this._escapeHtml(hostInfo.name)}</div>
+                        <div class="host-details">${hostInfo.ip} &middot; ${fileLabel} shared</div>
+                    </div>
+                    <button class="btn host-connect-btn">Connect</button>
+                `;
+                card.querySelector('.host-connect-btn').addEventListener('click', () => {
+                    this.connectToHost(hostInfo.server_url, hostInfo.hostId);
+                });
+                hostsList.appendChild(card);
+            });
+        } catch (error) {
+            hostsList.innerHTML = '<div class="no-hosts">No hosts found. Make sure a device is running as Host on your network.</div>';
+        }
+    }
+
+    _escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
     }
 
     async handleFiles(files) {
@@ -174,7 +357,8 @@ class LocalFileShare {
                 id: fileId,
                 name: file.name,
                 size: file.size,
-                type: file.type
+                type: file.type,
+                hostId: this.hostId || ''
             };
 
             const response = await fetch('/api/register-file', {
@@ -330,10 +514,10 @@ class LocalFileShare {
         console.log('[P2P] Starting signaling poll');
         this.pollSignaling();
 
-        // Poll every 2 seconds
+        // Poll every 800ms for fast ICE/signaling exchange
         this.signalingPollInterval = setInterval(() => {
             this.pollSignaling();
-        }, 2000);
+        }, 800);
     }
 
     stopSignalingPoll() {
@@ -345,14 +529,12 @@ class LocalFileShare {
     }
 
     async pollSignaling() {
+        if (!this.peerId) return; // Not registered yet
         try {
-            // Use role-based signaling - host gets offers, client gets answers
-            const role = this.isHost ? 'host' : 'client';
-            const response = await fetch(`/api/signal?role=${role}`);
+            const response = await fetch(`/api/signal?peerId=${encodeURIComponent(this.peerId)}`);
             if (response.ok) {
                 const data = await response.json();
                 if (data.messages && data.messages.length > 0) {
-                    console.log(`[Signaling] Retrieved ${data.messages.length} message(s) for ${role}`);
                     for (const message of data.messages) {
                         await this.handleSignalingMessage(message);
                     }
@@ -415,11 +597,10 @@ class LocalFileShare {
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' },
                 { urls: 'stun:stun2.l.google.com:19302' },
-                { urls: 'stun:stun3.l.google.com:19302' },
-                { urls: 'stun:stun4.l.google.com:19302' }
             ],
-            iceTransportPolicy: 'all', // Try all connection types
-            iceCandidatePoolSize: 10 // Pre-gather candidates
+            iceTransportPolicy: 'all',
+            sdpSemantics: 'unified-plan', // Required for Safari compatibility
+            // Note: iceCandidatePoolSize removed — breaks Safari
         });
 
         // Queue for ICE candidates that arrive before remote description is set
@@ -522,14 +703,21 @@ class LocalFileShare {
 
         dataChannel.binaryType = 'arraybuffer';
 
-        dataChannel.onopen = () => {
+        const onOpen = () => {
             console.log(`[P2P] ✅ Data channel opened with ${peerId}, readyState: ${dataChannel.readyState}`);
             this.dataChannels.set(peerId, dataChannel);
             this.showToast('Data channel ready for file transfer!', 'success');
-            
+
             // Update P2P status display
             this.updateP2PStatus();
         };
+
+        // Safari: ondatachannel fires when channel is already open, so onopen never fires
+        if (dataChannel.readyState === 'open') {
+            onOpen();
+        } else {
+            dataChannel.onopen = onOpen;
+        }
 
         dataChannel.onclose = () => {
             console.log(`[P2P] Data channel closed with ${peerId}`);
@@ -544,7 +732,7 @@ class LocalFileShare {
         };
 
         dataChannel.onmessage = (event) => {
-            this.handleDataChannelMessage(peerId, event.data);
+            this.handleDataChannelMessage(peerId, event);
         };
     }
 
@@ -591,6 +779,7 @@ class LocalFileShare {
                 console.log(`[P2P] 🧊 Processing ${pc.pendingIceCandidates.length} queued ICE candidates`);
                 for (const candidate of pc.pendingIceCandidates) {
                     try {
+                        if (!candidate || !candidate.candidate) continue;
                         await pc.addIceCandidate(new RTCIceCandidate(candidate));
                         console.log('[P2P] ✅ Queued ICE candidate added');
                     } catch (error) {
@@ -672,6 +861,11 @@ class LocalFileShare {
                     return;
                 }
                 
+                // Skip end-of-candidates markers — Safari throws on empty candidate string
+                if (!candidate || !candidate.candidate) {
+                    console.log('[P2P] 🧊 Skipping end-of-candidates marker');
+                    return;
+                }
                 await pc.addIceCandidate(new RTCIceCandidate(candidate));
                 console.log('[P2P] ✅ ICE candidate added successfully');
             } else {
@@ -685,12 +879,37 @@ class LocalFileShare {
 
     // ==================== Client Connection ====================
 
-    async connectToHost() {
-        const hostUrl = document.getElementById('hostUrl').value.trim();
+    async lookupHostId(url) {
+        try {
+            const base = url.endsWith('/') ? url.slice(0, -1) : url;
+            const res = await fetch(`${base}/api/hosts`);
+            if (!res.ok) return null;
+            const data = await res.json();
+            if (data.hosts && data.hosts.length > 0) return data.hosts[0].hostId;
+            return null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async connectToHost(url = null, hostId = null) {
+        const hostUrl = url || document.getElementById('hostUrl').value.trim();
         if (!hostUrl) {
             this.showConnectionStatus('Please enter a host URL', 'error');
             return;
         }
+
+        // Resolve hostId if not provided (manual URL entry)
+        let targetHostId = hostId;
+        if (!targetHostId) {
+            this.showConnectionStatus('Looking up host...', 'info');
+            targetHostId = await this.lookupHostId(hostUrl);
+            if (!targetHostId) {
+                this.showConnectionStatus('No active host found at that URL', 'error');
+                return;
+            }
+        }
+        this.currentTargetHostId = targetHostId;
 
         this.showConnectionStatus('Connecting...', 'info');
         this.currentHostUrl = hostUrl;
@@ -721,12 +940,12 @@ class LocalFileShare {
             
             // Stop and restart signaling
             this.stopSignalingPoll();
-            
-            const hostPeerId = 'host';
+
+            const hostPeerId = targetHostId;
 
             // Test connection to server
             const testUrl = hostUrl.endsWith('/') ? hostUrl + 'api/files' : hostUrl + '/api/files';
-            const response = await fetch(testUrl);
+            const response = await fetch(`${testUrl}?hostId=${encodeURIComponent(hostPeerId)}`);
 
             if (response.ok) {
                 this.showConnectionStatus('Connected to server, establishing P2P...', 'info');
@@ -753,10 +972,13 @@ class LocalFileShare {
     }
     
     async resetP2PConnection() {
+        const hostPeerId = this.currentTargetHostId;
+        if (!hostPeerId) {
+            this.showToast('No active connection to reset', 'error');
+            return;
+        }
         console.log('[P2P] Manual reset requested');
         this.showToast('Resetting P2P connection...', 'info');
-        
-        const hostPeerId = 'host';
         
         // Clean up ALL peer connections (not just host)
         console.log('[P2P] Cleaning up all peer connections...');
@@ -833,10 +1055,10 @@ class LocalFileShare {
     updateP2PStatus(status) {
         const statusEl = document.getElementById('p2pStatus');
         if (!statusEl) return;
-        
-        const hostPeerId = 'host';
-        const pc = this.peerConnections.get(hostPeerId);
-        const dc = this.dataChannels.get(hostPeerId);
+
+        const hostPeerId = this.currentTargetHostId;
+        const pc = hostPeerId ? this.peerConnections.get(hostPeerId) : null;
+        const dc = hostPeerId ? this.dataChannels.get(hostPeerId) : null;
         
         // Determine current status if not provided
         if (!status) {
@@ -854,14 +1076,6 @@ class LocalFileShare {
         }
         
         // Update display
-        const statusIcons = {
-            'connected': '✅',
-            'connecting': '🔄',
-            'disconnected': '⚠️',
-            'failed': '❌',
-            'unknown': '❓'
-        };
-        
         const statusTexts = {
             'connected': 'P2P Connected',
             'connecting': 'P2P Connecting...',
@@ -869,8 +1083,8 @@ class LocalFileShare {
             'failed': 'P2P Failed',
             'unknown': 'P2P Status Unknown'
         };
-        
-        statusEl.innerHTML = `${statusIcons[status]} ${statusTexts[status]}`;
+
+        statusEl.textContent = statusTexts[status] || 'P2P Status Unknown';
         statusEl.className = `p2p-status status-${status}`;
     }
 
@@ -912,8 +1126,8 @@ class LocalFileShare {
             const dataChannel = pc.createDataChannel('fileTransfer', { ordered: true });
             this.setupDataChannel(hostPeerId, dataChannel);
 
-            // Create offer
-            const offer = await pc.createOffer();
+            // Create offer — pass explicit constraints for Safari compatibility
+            const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
             await pc.setLocalDescription(offer);
 
             // Send offer to host
@@ -941,10 +1155,12 @@ class LocalFileShare {
         const availableFiles = document.getElementById('availableFiles');
 
         try {
-            // Use the current host URL if connecting to remote, otherwise use relative path
-            const filesUrl = this.currentHostUrl ?
-                (this.currentHostUrl.endsWith('/') ? this.currentHostUrl + 'api/files' : this.currentHostUrl + '/api/files') :
-                '/api/files';
+            // Fetch files for the specific host we're connecting to
+            const base = this.currentHostUrl
+                ? (this.currentHostUrl.endsWith('/') ? this.currentHostUrl.slice(0,-1) : this.currentHostUrl)
+                : '';
+            const hostParam = this.currentTargetHostId ? `?hostId=${encodeURIComponent(this.currentTargetHostId)}` : '';
+            const filesUrl = `${base}/api/files${hostParam}`;
 
             console.log('Fetching files from:', filesUrl);
             const response = await fetch(filesUrl);
@@ -984,7 +1200,11 @@ class LocalFileShare {
 
     async downloadFileP2P(fileId, fileName) {
         try {
-            const hostPeerId = 'host';
+            const hostPeerId = this.currentTargetHostId;
+            if (!hostPeerId) {
+                this.showToast('Not connected to a host', 'error');
+                return;
+            }
             
             // Check if we have an existing open data channel
             let dataChannel = this.dataChannels.get(hostPeerId);
@@ -1176,7 +1396,8 @@ class LocalFileShare {
         }
     }
 
-    handleDataChannelMessage(peerId, data) {
+    handleDataChannelMessage(peerId, event) {
+        const data = event.data;
         // Check if it's JSON (metadata) or binary (file data)
         if (typeof data === 'string') {
             try {
@@ -1185,8 +1406,11 @@ class LocalFileShare {
             } catch (error) {
                 console.error('[P2P] Error parsing control message:', error);
             }
+        } else if (data instanceof Blob) {
+            // Safari sends Blob even when binaryType = 'arraybuffer'
+            data.arrayBuffer().then(buffer => this.handleFileChunk(peerId, buffer));
         } else {
-            // Binary data - file chunk
+            // ArrayBuffer (Chrome, Firefox)
             this.handleFileChunk(peerId, data);
         }
     }
@@ -1265,16 +1489,23 @@ class LocalFileShare {
             chunkSize: 64 * 1024 // Reduced to 64KB chunks for better flow control
         }));
 
-        // Read and send file in chunks with proper flow control
-        const chunkSize = 64 * 1024; // 64KB chunks (smaller = more reliable for large files)
-        const BUFFER_THRESHOLD = 16 * 1024 * 1024; // 16MB buffer threshold
+        // Read and send file in chunks with event-driven flow control
+        const chunkSize   = 64 * 1024;   // 64 KB per chunk
+        const BUFFER_HIGH = 512 * 1024;  // pause when buffered > 512 KB (Safari-safe)
+        const BUFFER_LOW  = 128 * 1024;  // resume when buffered drops to 128 KB
+
+        // Use event-driven resume — no 100 ms polling delay
+        dataChannel.bufferedAmountLowThreshold = BUFFER_LOW;
+
         const reader = new FileReader();
         let offset = 0;
         let chunkIndex = 0;
+        let paused = false;
 
         const sendNextChunk = () => {
+            if (paused) return;
+
             if (offset >= file.size) {
-                // File transfer complete
                 dataChannel.send(JSON.stringify({
                     type: 'file-complete',
                     transferId: fileId
@@ -1283,11 +1514,14 @@ class LocalFileShare {
                 return;
             }
 
-            // CRITICAL: Check buffer before sending to prevent overflow
-            if (dataChannel.bufferedAmount > BUFFER_THRESHOLD) {
-                console.log(`[P2P] Buffer full (${dataChannel.bufferedAmount} bytes), waiting...`);
-                // Wait for buffer to drain before sending more
-                setTimeout(() => sendNextChunk(), 100);
+            if (dataChannel.bufferedAmount > BUFFER_HIGH) {
+                // Pause and wait for the buffer-low event instead of polling
+                paused = true;
+                dataChannel.onbufferedamountlow = () => {
+                    dataChannel.onbufferedamountlow = null;
+                    paused = false;
+                    sendNextChunk();
+                };
                 return;
             }
 
@@ -1302,18 +1536,15 @@ class LocalFileShare {
                     offset += e.target.result.byteLength;
                     chunkIndex++;
 
-                    // Log progress every 100 chunks
                     if (chunkIndex % 100 === 0) {
                         const progress = Math.round((offset / file.size) * 100);
                         console.log(`[P2P] Sending ${file.name}: ${progress}% (buffer: ${dataChannel.bufferedAmount} bytes)`);
                     }
 
-                    // Send next chunk with small delay to avoid overwhelming
-                    setTimeout(() => sendNextChunk(), 0);
+                    sendNextChunk();
                 } catch (error) {
                     console.error('[P2P] Error sending chunk:', error);
-                    // Try to recover by waiting and retrying
-                    setTimeout(() => sendNextChunk(), 100);
+                    setTimeout(() => sendNextChunk(), 50);
                 }
             } else {
                 console.error('[P2P] Data channel closed during transfer');
@@ -1735,7 +1966,7 @@ class LocalFileShare {
         progressContainer.className = 'download-progress';
         progressContainer.innerHTML = `
             <div class="progress-header">
-                <span class="progress-filename">📥 ${fileName}</span>
+                <span class="progress-filename">${fileName}</span>
                 <span class="progress-percentage">0%</span>
             </div>
             <div class="progress-bar-container">
@@ -1903,6 +2134,7 @@ class LocalFileShare {
                             document.getElementById('hostUrl').value = code.data;
                             this.closeQRScanner();
                             this.showToast('QR Code scanned successfully!');
+                            this.connectToHost(code.data);
                             return;
                         }
                     } catch (error) {
@@ -1964,13 +2196,14 @@ class LocalFileShare {
     // ==================== Utility Methods ====================
 
     getFileIcon(mimeType) {
-        if (mimeType.startsWith('image/')) return '🖼️';
-        if (mimeType.startsWith('video/')) return '🎬';
-        if (mimeType.startsWith('audio/')) return '🎵';
-        if (mimeType.includes('pdf')) return '📄';
-        if (mimeType.includes('text/') || mimeType.includes('document')) return '📝';
-        if (mimeType.includes('zip') || mimeType.includes('rar')) return '📦';
-        return '📁';
+        if (!mimeType) return '<span class="file-type-badge">FILE</span>';
+        if (mimeType.startsWith('image/')) return '<span class="file-type-badge img">IMG</span>';
+        if (mimeType.startsWith('video/')) return '<span class="file-type-badge vid">VID</span>';
+        if (mimeType.startsWith('audio/')) return '<span class="file-type-badge aud">AUD</span>';
+        if (mimeType.includes('pdf')) return '<span class="file-type-badge pdf">PDF</span>';
+        if (mimeType.includes('text/') || mimeType.includes('document')) return '<span class="file-type-badge txt">TXT</span>';
+        if (mimeType.includes('zip') || mimeType.includes('rar') || mimeType.includes('tar')) return '<span class="file-type-badge zip">ZIP</span>';
+        return '<span class="file-type-badge">FILE</span>';
     }
 
     formatFileSize(bytes) {

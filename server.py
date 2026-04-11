@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-WebRTC Signaling Server for P2P File Share  
-Coordinates P2P connections with role-based message queuing
+WebRTC Signaling Server for P2P File Share
+Multi-host support with named device discovery
+Serves both HTTP (port 8080) and HTTPS (port 8443) for Safari/iOS compatibility.
 """
 
 import http.server
@@ -9,23 +10,30 @@ import socketserver
 import json
 import socket
 import time
+import threading
+import uuid
+import urllib.parse
+import ssl
+import os
+import subprocess
+import tempfile
+
+HOST_EXPIRY_SECONDS = 45  # Remove hosts not seen in 45s (3 missed heartbeats)
+
+server_port = 8080          # set in main()
+https_server_port = None    # set after HTTPS server starts successfully
+
 
 class FileShareHandler(http.server.SimpleHTTPRequestHandler):
-    shared_files = {}  # File metadata only
-    # Role-based signaling queues - CRITICAL for proper P2P
-    signaling_queue = {
-        'host': [],    # Messages FOR host (offers, ICE from clients)
-        'client': []   # Messages FOR clients (answers, ICE from host)
-    }
-    peer_last_seen = {}
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    shared_files    = {}  # {fileId: {name, size, type, host_id}}
+    registered_hosts = {}  # {hostId: {name, ip, server_url, last_seen}}
+    peer_inboxes    = {}  # {peerId: [messages]}
+    _lock = threading.Lock()
 
     def do_GET(self):
         if self.path == '/':
             self.path = '/index.html'
-        elif self.path == '/api/files':
+        elif self.path.startswith('/api/files'):
             self.handle_file_list()
             return
         elif self.path.startswith('/api/signal'):
@@ -34,7 +42,9 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == '/api/network-info':
             self.handle_network_info()
             return
-        
+        elif self.path == '/api/hosts':
+            self.handle_hosts_list()
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -42,17 +52,22 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_file_registration()
         elif self.path == '/api/signal':
             self.handle_signal_post()
+        elif self.path == '/api/register-host':
+            self.handle_register_host()
+        elif self.path == '/api/heartbeat':
+            self.handle_heartbeat()
         else:
             self.send_error(404)
-    
+
     def do_DELETE(self):
         if self.path.startswith('/api/remove-file/'):
             self.handle_file_removal()
+        elif self.path.startswith('/api/deregister-host/'):
+            self.handle_deregister_host()
         else:
             self.send_error(404)
-    
+
     def do_OPTIONS(self):
-        """Handle CORS preflight requests"""
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
@@ -60,220 +75,368 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Max-Age', '86400')
         self.end_headers()
 
-    def handle_file_list(self):
-        """Return list of shared files (metadata only)"""
+    # ── Host Registry ──────────────────────────────────────────────────────────
+
+    def handle_register_host(self):
+        """Register a named host; returns its unique hostId."""
         try:
-            files = []
-            for file_id, file_info in self.shared_files.items():
-                files.append({
-                    'id': file_id,
-                    'name': file_info['name'],
-                    'size': file_info['size'],
-                    'type': file_info['type']
-                })
-            
-            self.send_json_response({'files': files})
+            data = self._read_json()
+            name = (data.get('name') or 'Unknown Device').strip()[:50]
+            host_id = 'host_' + uuid.uuid4().hex[:12]
+            local_ip = self.get_local_ip()
+
+            # Prefer HTTPS URL so that Safari/iOS clients can connect
+            if https_server_port:
+                srv_url = f'https://{local_ip}:{https_server_port}'
+            else:
+                srv_url = f'http://{local_ip}:{server_port}'
+
+            with self._lock:
+                self.registered_hosts[host_id] = {
+                    'name': name,
+                    'ip': local_ip,
+                    'server_url': srv_url,
+                    'last_seen': time.time(),
+                }
+
+            print(f"[Host] Registered '{name}' as {host_id}")
+            self.send_json_response({'hostId': host_id, 'server_url': srv_url})
         except Exception as e:
-            self.send_error(500, f"Error listing files: {str(e)}")
+            self.send_error(500, str(e))
+
+    def handle_heartbeat(self):
+        """Keep a host alive."""
+        try:
+            data = self._read_json()
+            host_id = data.get('hostId')
+            with self._lock:
+                if host_id in self.registered_hosts:
+                    self.registered_hosts[host_id]['last_seen'] = time.time()
+                    self.send_json_response({'status': 'ok'})
+                else:
+                    self.send_error(404, 'Host not found')
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_deregister_host(self):
+        """Remove a host and its files."""
+        try:
+            host_id = self.path.split('/')[-1]
+            with self._lock:
+                host = self.registered_hosts.pop(host_id, None)
+                if host:
+                    removed = [fid for fid, f in self.shared_files.items()
+                               if f.get('host_id') == host_id]
+                    for fid in removed:
+                        del self.shared_files[fid]
+                    print(f"[Host] Deregistered '{host['name']}' ({host_id}), "
+                          f"removed {len(removed)} file(s)")
+            self.send_json_response({'status': 'ok'})
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_hosts_list(self):
+        """Return all active (non-expired) hosts with their file counts."""
+        try:
+            now = time.time()
+            with self._lock:
+                # Expire stale hosts
+                expired = [hid for hid, h in self.registered_hosts.items()
+                           if now - h['last_seen'] > HOST_EXPIRY_SECONDS]
+                for hid in expired:
+                    del self.registered_hosts[hid]
+                    print(f"[Host] Expired stale host {hid}")
+
+                hosts = []
+                for hid, h in self.registered_hosts.items():
+                    count = sum(1 for f in self.shared_files.values()
+                                if f.get('host_id') == hid)
+                    hosts.append({
+                        'hostId': hid,
+                        'name': h['name'],
+                        'ip': h['ip'],
+                        'server_url': h['server_url'],
+                        'files_count': count,
+                    })
+
+            self.send_json_response({'hosts': hosts})
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    # ── Signaling (per-peer inbox) ─────────────────────────────────────────────
 
     def handle_signal_post(self):
-        """Handle WebRTC signaling with role-based routing"""
+        """Route a signaling message into the recipient's inbox."""
         try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            signal_data = json.loads(post_data.decode())
-            
-            msg_type = signal_data.get('type')
+            signal_data = self._read_json()
+            to_peer   = signal_data.get('to')
             from_peer = signal_data.get('from', 'unknown')
-            
-            # Route message to correct queue based on type
-            if msg_type == 'offer':
-                # Offers go to HOST queue
-                self.signaling_queue['host'].append(signal_data)
-                print(f"[P2P Signaling] → Added {msg_type} to HOST queue (size: {len(self.signaling_queue['host'])})")
-                
-            elif msg_type == 'answer':
-                # Answers go to CLIENT queue
-                self.signaling_queue['client'].append(signal_data)
-                print(f"[P2P Signaling] → Added {msg_type} to CLIENT queue (size: {len(self.signaling_queue['client'])})")
-                
-            elif msg_type == 'ice-candidate':
-                # ICE candidates go to BOTH queues
-                self.signaling_queue['host'].append(signal_data)
-                self.signaling_queue['client'].append(signal_data)
-                print(f"[P2P Signaling] → Added {msg_type} to BOTH queues")
-            
-            self.peer_last_seen[from_peer] = time.time()
-            self.send_json_response({'status': 'success'})
-            
-        except Exception as e:
-            print(f"[P2P Signaling] ERROR: {e}")
-            self.send_error(500, str(e))
-    
-    def handle_signal_get(self):
-        """Retrieve messages based on role (host or client)"""
-        try:
-            # Parse query parameters for role
-            import urllib.parse
-            parsed = urllib.parse.urlparse(self.path)
-            params = urllib.parse.parse_qs(parsed.query)
-            role = params.get('role', [''])[0]
-            
-            if role not in ['host', 'client']:
-                self.send_error(400, "Missing or invalid role parameter. Use ?role=host or ?role=client")
+            msg_type  = signal_data.get('type')
+
+            if not to_peer:
+                self.send_error(400, "Missing 'to' field")
                 return
-            
-            # Get messages for this role
-            messages = self.signaling_queue.get(role, [])
-            
-            # Clear queue after retrieval
-            self.signaling_queue[role] = []
-            
-            if messages:
-                print(f"[P2P Signaling] → {role.upper()} retrieved {len(messages)} message(s)")
-            
-            self.send_json_response({'messages': messages})
-            
+
+            with self._lock:
+                self.peer_inboxes.setdefault(to_peer, []).append(signal_data)
+
+            print(f"[Signal] {msg_type} {from_peer[:14]} → {to_peer[:14]}")
+            self.send_json_response({'status': 'success'})
         except Exception as e:
-            print(f"[P2P Signaling] ERROR: {e}")
+            print(f"[Signal] ERROR: {e}")
             self.send_error(500, str(e))
 
-    def handle_file_registration(self):
-        """Register file metadata (no actual file storage)"""
+    def handle_signal_get(self):
+        """Return and clear a peer's inbox."""
         try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            file_info = json.loads(post_data.decode())
-            
-            self.shared_files[file_info['id']] = {
-                'name': file_info['name'],
-                'size': file_info['size'],
-                'type': file_info['type']
-            }
-            
-            print(f"📁 File registered (metadata only): {file_info['name']} ({self.formatFileSize(file_info['size'])})")
-            
+            params  = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            peer_id = params.get('peerId', [''])[0]
+
+            if not peer_id:
+                self.send_error(400, "Missing peerId parameter")
+                return
+
+            with self._lock:
+                messages = self.peer_inboxes.pop(peer_id, [])
+
+            if messages:
+                print(f"[Signal] {peer_id[:14]} retrieved {len(messages)} msg(s)")
+
+            self.send_json_response({'messages': messages})
+        except Exception as e:
+            print(f"[Signal] ERROR: {e}")
+            self.send_error(500, str(e))
+
+    # ── File Registry ──────────────────────────────────────────────────────────
+
+    def handle_file_list(self):
+        """Return files, optionally filtered by hostId."""
+        try:
+            params  = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            host_id = params.get('hostId', [''])[0]
+
+            with self._lock:
+                files = [
+                    {'id': fid, 'name': f['name'], 'size': f['size'], 'type': f['type']}
+                    for fid, f in self.shared_files.items()
+                    if not host_id or f.get('host_id') == host_id
+                ]
+
+            self.send_json_response({'files': files})
+        except Exception as e:
+            self.send_error(500, f"Error listing files: {e}")
+
+    def handle_file_registration(self):
+        """Register file metadata (no actual file stored)."""
+        try:
+            info = self._read_json()
+            with self._lock:
+                self.shared_files[info['id']] = {
+                    'name':    info['name'],
+                    'size':    info['size'],
+                    'type':    info['type'],
+                    'host_id': info.get('hostId', ''),
+                }
+            print(f"[File] Registered: {info['name']} ({self.fmt_size(info['size'])})")
             self.send_json_response({'status': 'success'})
-            
         except Exception as e:
             self.send_error(500, str(e))
 
     def handle_file_removal(self):
-        """Remove file metadata"""
+        """Remove file metadata."""
         try:
             file_id = self.path.split('/')[-1]
-            
-            if file_id in self.shared_files:
-                file_name = self.shared_files[file_id]['name']
-                del self.shared_files[file_id]
-                print(f"🗑️ File removed: {file_name}")
+            with self._lock:
+                info = self.shared_files.pop(file_id, None)
+            if info:
+                print(f"[File] Removed: {info['name']}")
                 self.send_json_response({'status': 'success'})
             else:
-                self.send_error(404, "File not found")
-                
+                self.send_error(404, 'File not found')
         except Exception as e:
             self.send_error(500, str(e))
 
-    def formatFileSize(self, bytes):
-        """Format file size for display"""
-        if bytes == 0:
-            return '0 Bytes'
-        k = 1024
-        sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB']
-        i = int(bytes // (k ** (len(sizes) - 1)))
-        for idx, size in enumerate(sizes):
-            if bytes < k ** (idx + 1):
-                return f"{bytes / (k ** idx):.1f} {size}"
-        return f"{bytes / (k ** (len(sizes) - 1)):.1f} {sizes[-1]}"
+    # ── Network Info ───────────────────────────────────────────────────────────
 
     def handle_network_info(self):
-        """Return network information"""
         try:
             local_ip = self.get_local_ip()
+            http_url  = f'http://{local_ip}:{server_port}'
             info = {
-                'local_ip': local_ip,
-                'server_url': f'http://{local_ip}:{server_port}',
-                'status': 'running'
+                'local_ip':   local_ip,
+                'server_url': http_url,
+                'status':     'running',
             }
+            if https_server_port:
+                info['https_url'] = f'https://{local_ip}:{https_server_port}'
             self.send_json_response(info)
         except Exception as e:
             self.send_error(500, str(e))
 
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _read_json(self):
+        length = int(self.headers['Content-Length'])
+        return json.loads(self.rfile.read(length).decode())
+
     def send_json_response(self, data):
-        """Send JSON response"""
-        json_data = json.dumps(data).encode()
+        body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(json_data)))
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(json_data)
+        self.wfile.write(body)
 
     def get_local_ip(self):
-        """Get local IP address"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("8.8.8.8", 80))
+                s.connect(('8.8.8.8', 80))
                 return s.getsockname()[0]
-        except:
-            return "127.0.0.1"
+        except Exception:
+            return '127.0.0.1'
 
-    def log_message(self, format, *args):
-        """Custom logging"""
-        print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} - {format % args}")
+    def fmt_size(self, b):
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if b < 1024:
+                return f'{b:.1f} {unit}'
+            b /= 1024
+        return f'{b:.1f} TB'
 
-def get_available_port(start_port=8080):
-    """Find available port"""
-    for port in range(start_port, start_port + 100):
+    def log_message(self, fmt, *args):
+        pass  # Suppress per-request HTTP logs (our own prints are enough)
+
+
+# ── HTTPS support ──────────────────────────────────────────────────────────────
+
+def generate_self_signed_cert(local_ip):
+    """Generate a self-signed SSL certificate for the local IP."""
+    cert_dir = tempfile.mkdtemp()
+    cert_file = os.path.join(cert_dir, 'cert.pem')
+    key_file  = os.path.join(cert_dir, 'key.pem')
+
+    # openssl config with SubjectAltName so modern browsers accept the cert
+    cnf_content = (
+        '[req]\n'
+        'distinguished_name = req_distinguished_name\n'
+        'x509_extensions = v3_req\n'
+        'prompt = no\n'
+        '[req_distinguished_name]\n'
+        f'CN = {local_ip}\n'
+        '[v3_req]\n'
+        f'subjectAltName = IP:{local_ip},IP:127.0.0.1\n'
+    )
+    cnf_file = os.path.join(cert_dir, 'san.cnf')
+    with open(cnf_file, 'w') as f:
+        f.write(cnf_content)
+
+    result = subprocess.run(
+        [
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+            '-keyout', key_file, '-out', cert_file,
+            '-days', '730', '-config', cnf_file,
+        ],
+        capture_output=True, timeout=20,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode().strip())
+
+    return cert_file, key_file
+
+
+def run_https_server(port, cert_file, key_file):
+    """Run HTTPS server sharing the same handler (and thus the same state)."""
+    global https_server_port
+
+    class HttpsServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            super().server_bind()
+
+    try:
+        with HttpsServer(('', port), FileShareHandler) as httpsd:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert_file, key_file)
+            httpsd.socket = ctx.wrap_socket(httpsd.socket, server_side=True)
+            https_server_port = port          # signal main thread it's ready
+            httpsd.serve_forever()
+    except Exception as e:
+        print(f'[HTTPS] Server error: {e}')
+
+
+# ── Port helpers ───────────────────────────────────────────────────────────────
+
+def get_available_port(start=8080):
+    for port in range(start, start + 100):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(('', port))
                 return port
         except OSError:
             continue
-    raise Exception("No available ports found")
+    raise RuntimeError('No available ports found')
 
-def print_server_info(port):
-    """Print server info"""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-    except:
-        local_ip = "127.0.0.1"
-    
-    print("=" * 65)
-    print("🚀 P2P File Share Server (Role-Based Signaling)")
-    print("=" * 65)
-    print(f"📡 Port: {port}")
-    print(f"🌐 Local: http://localhost:{port}")
-    print(f"📱 Network: http://{local_ip}:{port}")
-    print("=" * 65)
-    print("Press Ctrl+C to stop")
-    print()
 
 def main():
     global server_port
-    
     try:
         server_port = get_available_port(8080)
-        
-        class LoggingTCPServer(socketserver.TCPServer):
+
+        class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            daemon_threads = True
             def server_bind(self):
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 super().server_bind()
-        
-        with LoggingTCPServer(("", server_port), FileShareHandler) as httpd:
-            print_server_info(server_port)
-            
+
+        with Server(('', server_port), FileShareHandler) as httpd:
+            local_ip = FileShareHandler.get_local_ip(None)
+
+            # ── Try to start HTTPS server ──────────────────────────────────────
+            https_started = False
+            try:
+                cert_file, key_file = generate_self_signed_cert(local_ip)
+                https_port_candidate = get_available_port(8443)
+                https_thread = threading.Thread(
+                    target=run_https_server,
+                    args=(https_port_candidate, cert_file, key_file),
+                    daemon=True,
+                )
+                https_thread.start()
+                # Give the HTTPS thread a moment to bind and set https_server_port
+                time.sleep(0.8)
+                https_started = (https_server_port is not None)
+            except Exception as e:
+                print(f'[HTTPS] Could not start ({e})')
+
+            # ── Print startup info ─────────────────────────────────────────────
+            print('=' * 60)
+            print('P2P File Share Server')
+            print('=' * 60)
+            print(f'Local (host device):  http://localhost:{server_port}')
+            print(f'HTTP:                 http://{local_ip}:{server_port}')
+            if https_started:
+                print(f'HTTPS (for Safari):   https://{local_ip}:{https_server_port}')
+                print()
+                print('Safari / iOS users must open the HTTPS URL.')
+                print('On first visit, tap "Advanced" → "visit this website"')
+                print('to accept the self-signed certificate.')
+            else:
+                print()
+                print('WARNING: HTTPS unavailable — Safari/iOS may not work.')
+                print('(Install openssl and restart to enable HTTPS.)')
+            print('=' * 60)
+            print('Press Ctrl+C to stop\n')
+
             try:
                 httpd.serve_forever()
             except KeyboardInterrupt:
-                print("\n\n🛑 Server stopped")
+                print('\nServer stopped')
                 httpd.shutdown()
-                
-    except Exception as e:
-        print(f"❌ Error: {e}")
 
-if __name__ == "__main__":
+    except Exception as e:
+        print(f'Error: {e}')
+
+
+if __name__ == '__main__':
     main()

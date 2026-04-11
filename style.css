@@ -99,13 +99,7 @@ header p {
     background: #f8fff8;
 }
 
-.mode-btn .icon {
-    font-size: 2rem;
-    display: block;
-    margin-bottom: 10px;
-}
-
-.mode-btn span:not(.icon) {
+.mode-btn-title {
     font-weight: bold;
     color: #333;
     display: block;
@@ -158,8 +152,8 @@ header p {
 }
 
 .upload-icon {
-    font-size: 3rem;
     margin-bottom: 15px;
+    color: #aaa;
 }
 
 .upload-text h3 {
@@ -191,8 +185,9 @@ header p {
 }
 
 .file-icon {
-    font-size: 1.5rem;
     margin-right: 15px;
+    display: flex;
+    align-items: center;
 }
 
 .file-info {
@@ -267,6 +262,179 @@ header p {
     display: flex;
     justify-content: center;
 }
+
+/* Host Name Setup */
+.host-name-setup {
+    margin-bottom: 8px;
+}
+
+.setup-hint {
+    color: #666;
+    font-size: 0.9rem;
+    margin-bottom: 14px;
+    line-height: 1.4;
+}
+
+.setup-status {
+    margin-top: 10px;
+    font-size: 0.9rem;
+    min-height: 1.2em;
+}
+
+.setup-status.error { color: #c0392b; }
+.setup-status.info  { color: #555; }
+
+.hosting-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: #f0faf0;
+    border: 1px solid #b8ddb8;
+    border-radius: 8px;
+    margin-bottom: 24px;
+    font-size: 0.95rem;
+    color: #2a6e2a;
+}
+
+.hosting-badge strong {
+    flex: 1;
+}
+
+/* Host Discovery */
+.discovery-section {
+    margin-bottom: 24px;
+}
+
+.discovery-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+}
+
+.discovery-header h3 {
+    margin: 0;
+    color: #333;
+}
+
+.btn-refresh {
+    background: none;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: #555;
+    transition: all 0.2s ease;
+}
+
+.btn-refresh:hover {
+    border-color: #4CAF50;
+    color: #4CAF50;
+}
+
+.hosts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.host-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    background: #f9f9f9;
+    border: 1px solid #eee;
+    border-radius: 10px;
+    transition: all 0.2s ease;
+}
+
+.host-card:hover {
+    border-color: #4CAF50;
+    background: #f8fff8;
+}
+
+.host-card-info {
+    flex: 1;
+}
+
+.host-name {
+    font-weight: 600;
+    color: #222;
+    font-size: 1rem;
+    margin-bottom: 3px;
+}
+
+.host-details {
+    font-size: 0.85rem;
+    color: #888;
+}
+
+.host-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4CAF50;
+    margin-right: 14px;
+    flex-shrink: 0;
+}
+
+.discovering {
+    color: #999;
+    font-size: 0.95rem;
+    padding: 12px 0;
+    text-align: center;
+}
+
+.no-hosts {
+    color: #999;
+    font-size: 0.9rem;
+    padding: 12px 0;
+    text-align: center;
+}
+
+.manual-connect-toggle {
+    margin-bottom: 16px;
+    text-align: center;
+}
+
+.link-btn {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+}
+
+.link-btn:hover {
+    color: #555;
+}
+
+/* File type badges */
+.file-type-badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: white;
+    background: #999;
+    text-transform: uppercase;
+    min-width: 38px;
+    text-align: center;
+}
+
+.file-type-badge.img { background: #2196F3; }
+.file-type-badge.vid { background: #9C27B0; }
+.file-type-badge.aud { background: #FF9800; }
+.file-type-badge.pdf { background: #F44336; }
+.file-type-badge.txt { background: #4CAF50; }
+.file-type-badge.zip { background: #795548; }
 
 /* Connect Form */
 .connect-form {
@@ -558,10 +726,6 @@ header p {
     text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
-.download-progress-list h3:before {
-    content: '📊 ';
-    margin-right: 8px;
-}
 
 .download-progress {
     background: white;
@@ -655,15 +819,6 @@ header p {
     font-weight: 500;
 }
 
-.progress-speed::before {
-    content: '⚡';
-    font-size: 1.2em;
-}
-
-.progress-remaining::before {
-    content: '⏱️';
-    font-size: 1.2em;
-}
 
 /* Animations */
 @keyframes shimmer {

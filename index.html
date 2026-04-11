@@ -11,7 +11,7 @@
 <body>
     <div class="container">
         <header>
-            <h1>🚀 Local File Share</h1>
+            <h1>Local File Share</h1>
             <p>Share files without internet - Local Network Only</p>
         </header>
 
@@ -25,64 +25,101 @@
 
         <div class="mode-selector">
             <button id="hostBtn" class="mode-btn active">
-                <span class="icon">📡</span>
-                <span>Host Files</span>
+                <span class="mode-btn-title">Host Files</span>
                 <small>Share files from this device</small>
             </button>
             <button id="clientBtn" class="mode-btn">
-                <span class="icon">📱</span>
-                <span>Connect to Host</span>
+                <span class="mode-btn-title">Connect to Host</span>
                 <small>Receive files from another device</small>
             </button>
         </div>
 
         <!-- Host Mode -->
         <div id="hostMode" class="mode-content active">
-            <div class="upload-area" id="uploadArea">
-                <div class="upload-icon">📁</div>
-                <div class="upload-text">
-                    <h3>Drop files here or click to select</h3>
-                    <p>Share files with other devices on your network</p>
+
+            <!-- Step 1: Enter name -->
+            <div id="hostNameSetup" class="host-name-setup">
+                <p class="setup-hint">Enter a name so other devices can identify you on the network</p>
+                <div class="input-group">
+                    <input type="text" id="hostName" placeholder="e.g. John's Laptop" maxlength="50" autocomplete="off">
+                    <button id="startHostingBtn">Start Hosting</button>
                 </div>
-                <input type="file" id="fileInput" multiple>
+                <div id="hostSetupStatus" class="setup-status"></div>
             </div>
 
-            <div id="fileList" class="file-list"></div>
-
-            <div class="share-info" id="shareInfo" style="display: none;">
-                <h3>Share this URL with other devices:</h3>
-                <div class="url-display">
-                    <input type="text" id="shareUrl" readonly>
-                    <button id="copyBtn">📋 Copy</button>
+            <!-- Step 2: Hosting active -->
+            <div id="hostingActive" style="display: none;">
+                <div class="hosting-badge">
+                    Hosting as <strong id="hostingNameDisplay"></strong>
+                    <button id="stopHostingBtn" class="link-btn">Stop</button>
                 </div>
-                <div class="qr-code" id="qrCode"></div>
+
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                    </div>
+                    <div class="upload-text">
+                        <h3>Drop files here or click to select</h3>
+                        <p>Share files with other devices on your network</p>
+                    </div>
+                    <input type="file" id="fileInput" multiple>
+                </div>
+
+                <div id="fileList" class="file-list"></div>
+
+                <div class="share-info" id="shareInfo" style="display: none;">
+                    <h3>Share this URL with other devices:</h3>
+                    <div class="url-display">
+                        <input type="text" id="shareUrl" readonly>
+                        <button id="copyBtn">Copy</button>
+                    </div>
+                    <div class="qr-code" id="qrCode"></div>
+                </div>
             </div>
         </div>
 
         <!-- Client Mode -->
         <div id="clientMode" class="mode-content">
-            <div class="connect-form">
-                <h3>Connect to a Host</h3>
+
+            <!-- Host Discovery -->
+            <div class="discovery-section">
+                <div class="discovery-header">
+                    <h3>Available Hosts</h3>
+                    <button id="refreshHostsBtn" class="btn-refresh">Refresh</button>
+                </div>
+                <div id="hostsList" class="hosts-list">
+                    <div class="discovering">Searching for hosts...</div>
+                </div>
+            </div>
+
+            <!-- Manual Connect -->
+            <div class="manual-connect-toggle">
+                <button id="toggleManualBtn" class="link-btn">Enter URL manually</button>
+            </div>
+
+            <div id="manualConnectForm" class="connect-form" style="display: none;">
                 <div class="input-group">
-                    <input type="text" id="hostUrl" placeholder="Enter host URL or IP address">
+                    <input type="text" id="hostUrl" placeholder="http://192.168.x.x:8080">
                     <button id="connectBtn">Connect</button>
                 </div>
                 <div class="scan-option">
-                    <button id="scanBtn">📷 Scan QR Code</button>
+                    <button id="scanBtn">Scan QR Code</button>
                 </div>
             </div>
 
             <div id="connectionStatus" class="status-message"></div>
-            
+
             <div class="p2p-controls" id="p2pControls" style="display: none;">
-                <button id="resetP2PBtn" class="btn warning">🔄 Reset P2P Connection</button>
+                <button id="resetP2PBtn" class="btn warning">Reset Connection</button>
                 <span id="p2pStatus" class="p2p-status"></span>
             </div>
-            
+
             <div id="availableFiles" class="available-files"></div>
         </div>
-
-        <!-- Download Progress - Now handled dynamically by JavaScript -->
     </div>
 
     <!-- Camera Modal for QR Scanning -->
