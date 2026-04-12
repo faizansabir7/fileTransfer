@@ -18,7 +18,8 @@ class LocalFileShare {
         this.currentTargetHostId = null; // hostId of the host we're connected to
 
         // File transfer state
-        this.transfers = new Map(); // Map of transferId -> {chunks, received, total, fileName}
+        this.transfers = new Map(); // Map of transferId -> transfer object
+        this.pendingWritables = new Map(); // fileId -> {writable, writeQueue} — set before transfer starts
 
         // Keep-alive intervals for connections
         this.keepAliveIntervals = new Map(); // Map of peerId -> interval
@@ -1180,8 +1181,8 @@ class LocalFileShare {
                             <div class="file-name">${file.name}</div>
                             <div class="file-size">${this.formatFileSize(file.size)}</div>
                         </div>
-                        <button class="download-btn p2p-btn" onclick="fileShare.downloadFileP2P('${file.id}', '${file.name}')">
-                            📡 P2P Download
+                        <button class="download-btn p2p-btn" onclick="fileShare.downloadFileP2P('${file.id}', '${file.name}', ${file.size})">
+                            P2P Download
                         </button>
                     `;
                     availableFiles.appendChild(fileItem);
@@ -1198,103 +1199,87 @@ class LocalFileShare {
 
     // ==================== File Transfer via P2P ====================
 
-    async downloadFileP2P(fileId, fileName) {
-        try {
-            const hostPeerId = this.currentTargetHostId;
-            if (!hostPeerId) {
-                this.showToast('Not connected to a host', 'error');
-                return;
+    async downloadFileP2P(fileId, fileName, fileSize) {
+        const hostPeerId = this.currentTargetHostId;
+        if (!hostPeerId) {
+            this.showToast('Not connected to a host', 'error');
+            return;
+        }
+
+        // ── Step 1: Open save dialog NOW (requires user-gesture context) ──────
+        // showSaveFilePicker streams chunks directly to disk → no RAM accumulation.
+        // This must happen synchronously in the click handler before any awaits.
+        const hasStreamingSupport = 'showSaveFilePicker' in window;
+        const fileSizeMB = (fileSize || 0) / (1024 * 1024);
+
+        if (hasStreamingSupport) {
+            try {
+                const handle = await window.showSaveFilePicker({ suggestedName: fileName });
+                const writable = await handle.createWritable();
+                this.pendingWritables.set(fileId, { writable, writeQueue: Promise.resolve() });
+                console.log('[P2P] Save dialog accepted — will stream to disk');
+            } catch (e) {
+                if (e.name === 'AbortError') return; // user cancelled
+                // API unavailable in this context — fall back to in-memory
+                console.warn('[P2P] showSaveFilePicker failed, falling back to in-memory:', e.message);
             }
-            
-            // Check if we have an existing open data channel
+        } else if (fileSizeMB > 500) {
+            // Non-blocking warning — iOS/Android have no streaming API, large files may crash
+            this.showToast(
+                `${Math.round(fileSizeMB)} MB file — may be slow on mobile. Use a desktop browser for best results.`,
+                'warning'
+            );
+        }
+
+        // ── Step 2: Ensure P2P data channel is open ───────────────────────────
+        try {
             let dataChannel = this.dataChannels.get(hostPeerId);
             let pc = this.peerConnections.get(hostPeerId);
-            
-            console.log(`[P2P] Download requested for ${fileName}`);
-            console.log(`[P2P] Current state - PC: ${pc ? pc.connectionState : 'none'}, DC: ${dataChannel ? dataChannel.readyState : 'none'}`);
 
             if (!dataChannel || dataChannel.readyState !== 'open') {
-                console.log('[P2P] Data channel not ready, establishing connection...');
-                this.showToast('P2P connection not ready. Establishing connection...', 'warning');
-                
-                // Check if we need to create a new connection
-                const needNewConnection = !pc || 
-                    pc.connectionState === 'failed' || 
+                this.showToast('Establishing P2P connection...', 'info');
+
+                const needNew = !pc ||
+                    pc.connectionState === 'failed' ||
                     pc.connectionState === 'closed' ||
                     pc.connectionState === 'disconnected';
-                
-                if (needNewConnection) {
-                    console.log('[P2P] Creating new connection...');
-                    await this.initiateP2PConnection(hostPeerId);
-                } else {
-                    console.log('[P2P] Connection exists but data channel not ready, waiting...');
-                }
 
-                // Wait for connection with retry logic
+                if (needNew) await this.initiateP2PConnection(hostPeerId);
+
                 let attempts = 0;
-                const maxAttempts = 20;
-                while (attempts < maxAttempts) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    
-                    // Refresh references
+                while (attempts < 20) {
+                    await new Promise(r => setTimeout(r, 1000));
                     pc = this.peerConnections.get(hostPeerId);
                     dataChannel = this.dataChannels.get(hostPeerId);
-                    
-                    // Log detailed status
-                    if (pc) {
-                        console.log(`[P2P] Waiting for connection... (${attempts + 1}/${maxAttempts}) - PC: ${pc.connectionState}, ICE: ${pc.iceConnectionState}, Signaling: ${pc.signalingState}, DC: ${dataChannel ? dataChannel.readyState : 'none'}`);
-                    } else {
-                        console.log(`[P2P] Waiting for connection... (${attempts + 1}/${maxAttempts}) - No peer connection yet`);
-                    }
-                    
-                    if (dataChannel && dataChannel.readyState === 'open') {
-                        console.log('[P2P] ✅ Connection established and ready!');
-                        break;
-                    }
-                    
-                    // If connection failed, try to reconnect
+                    if (dataChannel && dataChannel.readyState === 'open') break;
                     if (pc && pc.connectionState === 'failed' && attempts === 5) {
-                        console.log('[P2P] Connection failed, attempting to reconnect...');
-                        if (pc) pc.close();
+                        pc.close();
                         this.peerConnections.delete(hostPeerId);
                         this.dataChannels.delete(hostPeerId);
                         await this.initiateP2PConnection(hostPeerId);
                     }
-                    
-                    // Try reconnecting again if still not connected
-                    if (attempts === 12 && (!dataChannel || dataChannel.readyState !== 'open')) {
-                        console.log('[P2P] Second reconnection attempt...');
-                        if (pc) pc.close();
-                        this.peerConnections.delete(hostPeerId);
-                        this.dataChannels.delete(hostPeerId);
-                        await this.initiateP2PConnection(hostPeerId);
-                    }
-                    
                     attempts++;
                 }
 
                 if (!dataChannel || dataChannel.readyState !== 'open') {
-                    const pcState = pc ? `PC: ${pc.connectionState}, ICE: ${pc.iceConnectionState}` : 'No connection';
-                    throw new Error(`Could not establish P2P connection after ${maxAttempts} attempts. ${pcState}`);
+                    this.pendingWritables.delete(fileId); // cleanup on failure
+                    throw new Error('Could not establish P2P connection');
                 }
-            } else {
-                console.log('[P2P] ✅ Using existing connection (already open)');
             }
 
-            console.log(`[P2P] Requesting file: ${fileName} (ID: ${fileId})`);
-
-            // Send file request
-            dataChannel.send(JSON.stringify({
-                type: 'file-request',
-                fileId: fileId,
-                fileName: fileName
-            }));
-
-            this.showToast(`Downloading ${fileName} via P2P...`, 'info');
+            // ── Step 3: Request the file ───────────────────────────────────────
+            dataChannel.send(JSON.stringify({ type: 'file-request', fileId, fileName }));
+            this.showToast(`Downloading ${fileName}…`, 'info');
 
         } catch (error) {
+            // Clean up any pending writable on error
+            const pending = this.pendingWritables.get(fileId);
+            if (pending) {
+                pending.writable.abort().catch(() => {});
+                this.pendingWritables.delete(fileId);
+            }
             console.error('[P2P] Error downloading file:', error);
-            this.showToast(`P2P download failed: ${error.message}`, 'error');
+            this.showToast(`Download failed: ${error.message}`, 'error');
         }
     }
     
@@ -1559,28 +1544,30 @@ class LocalFileShare {
     }
 
     initializeFileReceive(peerId, meta) {
-        console.log(`[P2P] 🚀 Initializing receive: ${meta.fileName}`);
-        console.log(`[P2P] 📦 File size: ${this.formatFileSize(meta.fileSize)}`);
-        console.log(`[P2P] 🆔 Transfer ID: ${meta.transferId}`);
+        console.log(`[P2P] Receive starting: ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`);
+
+        // Check if the user already opened a save dialog for this file
+        const pending = this.pendingWritables.get(meta.transferId);
+        if (pending) {
+            this.pendingWritables.delete(meta.transferId);
+            console.log('[P2P] Streaming mode: chunks go directly to disk');
+        }
 
         this.transfers.set(meta.transferId, {
-            fileName: meta.fileName,
-            fileSize: meta.fileSize,
-            fileType: meta.fileType,
-            chunkSize: meta.chunkSize,
-            chunks: [],
+            fileName:      meta.fileName,
+            fileSize:      meta.fileSize,
+            fileType:      meta.fileType,
+            chunks:        [],           // used only in fallback (non-streaming) mode
             receivedBytes: 0,
-            progressElement: null,
-            startTime: Date.now()
+            startTime:     Date.now(),
+            // Streaming-to-disk state (showSaveFilePicker path)
+            streamMode:    !!pending,
+            writable:      pending ? pending.writable    : null,
+            writeQueue:    pending ? pending.writeQueue  : null,
         });
 
-        // Prevent page unload during download
         this.preventUnloadDuringTransfer();
-
-        // Create progress UI
-        console.log(`[P2P] 🎨 About to create progress UI...`);
         this.createProgressUI(meta.transferId, meta.fileName);
-        console.log(`[P2P] ✅ Progress UI creation completed`);
     }
     
     preventUnloadDuringTransfer() {
@@ -1610,23 +1597,24 @@ class LocalFileShare {
     }
 
     handleFileChunk(peerId, chunk) {
-        // Find active transfer
         for (const [transferId, transfer] of this.transfers.entries()) {
             if (transfer.receivedBytes < transfer.fileSize) {
-                transfer.chunks.push(chunk);
                 transfer.receivedBytes += chunk.byteLength;
 
-                // Update progress
-                const progress = Math.round((transfer.receivedBytes / transfer.fileSize) * 100);
-                const elapsedTime = (Date.now() - transfer.startTime) / 1000; // seconds
-                const speed = transfer.receivedBytes / elapsedTime; // bytes per second
-                const remaining = (transfer.fileSize - transfer.receivedBytes) / speed; // seconds
-                
-                console.log(`[P2P] Receiving ${transfer.fileName}: ${progress}%`);
-                
-                // Update progress UI
-                this.updateProgressUI(transferId, progress, speed, remaining);
+                if (transfer.streamMode && transfer.writable) {
+                    // Chain writes to preserve order without blocking this handler
+                    transfer.writeQueue = transfer.writeQueue.then(() =>
+                        transfer.writable.write(chunk)
+                    );
+                } else {
+                    transfer.chunks.push(chunk);
+                }
 
+                const progress  = Math.round((transfer.receivedBytes / transfer.fileSize) * 100);
+                const elapsed   = (Date.now() - transfer.startTime) / 1000;
+                const speed     = transfer.receivedBytes / elapsed;
+                const remaining = (transfer.fileSize - transfer.receivedBytes) / speed;
+                this.updateProgressUI(transferId, progress, speed, remaining);
                 break;
             }
         }
@@ -1639,323 +1627,52 @@ class LocalFileShare {
             return;
         }
 
-        console.log(`[P2P] Completing file receive: ${transfer.fileName}`);
-        console.log(`[P2P] Total chunks received: ${transfer.chunks.length}, Total bytes: ${transfer.receivedBytes}`);
-
-        const fileSizeMB = transfer.fileSize / (1024 * 1024);
-        console.log(`[P2P] File size: ${fileSizeMB.toFixed(2)} MB`);
-        
-        // For very large files on mobile, try File System Access API first
-        if (this.isMobileBrowser() && fileSizeMB > 500 && 'showSaveFilePicker' in window) {
-            console.log('[P2P] Large file on mobile - attempting direct File System Access API write...');
-            try {
-                await this.saveFileDirectly(transfer);
-                this.showToast(`${transfer.fileName} downloaded successfully!`, 'success');
-                
-                setTimeout(() => {
-                    this.removeProgressUI(message.transferId);
-                }, 1000);
-                
-                setTimeout(() => {
-                    this.transfers.delete(message.transferId);
-                }, 2000);
-                return;
-            } catch (fsError) {
-                if (fsError.name === 'AbortError') {
-                    console.log('[P2P] User cancelled');
-                    this.removeProgressUI(message.transferId);
-                    this.transfers.delete(message.transferId);
-                    return;
-                }
-                console.log('[P2P] Direct save failed, trying blob method:', fsError.message);
-            }
-        }
+        console.log(`[P2P] Transfer complete: ${transfer.fileName} (${this.formatFileSize(transfer.receivedBytes)})`);
 
         try {
-            // Combine all chunks
-            // Use application/octet-stream to force download for all file types
-            console.log('[P2P] Creating blob from chunks...');
-            
-            // For mobile with large files, warn before creating blob
-            if (this.isMobileBrowser() && fileSizeMB > 800) {
-                console.warn('[P2P] ⚠️ Very large file on mobile - may cause memory issues');
-                this.showToast('Processing large file... Please wait and do not close the browser.', 'warning');
+            if (transfer.streamMode && transfer.writable) {
+                // Wait for all queued disk writes to finish, then close the file
+                await transfer.writeQueue;
+                await transfer.writable.close();
+                this.showToast(`${transfer.fileName} saved!`, 'success');
+            } else {
+                // Fallback: assemble Blob from in-memory chunks and trigger download
+                const blob = new Blob(transfer.chunks, {
+                    type: transfer.fileType || 'application/octet-stream'
+                });
+                transfer.chunks = []; // free chunk memory before creating URL
+                this.triggerDownload(blob, transfer.fileName);
+                this.showToast(`${transfer.fileName} downloaded!`, 'success');
             }
-            
-            const blob = new Blob(transfer.chunks, { 
-                type: transfer.fileType || 'application/octet-stream' 
-            });
-            console.log(`[P2P] Blob created: ${blob.size} bytes`);
 
-            // Use File System Access API if available (Chrome/Edge), otherwise fallback
-            await this.saveFileToDownloads(blob, transfer.fileName);
-
-            this.showToast(`${transfer.fileName} downloaded successfully!`, 'success');
-
-            // Remove progress UI after a short delay to show 100%
-            setTimeout(() => {
-                this.removeProgressUI(message.transferId);
-            }, 1000);
-
+            setTimeout(() => this.removeProgressUI(message.transferId), 1000);
         } catch (error) {
             console.error('[P2P] Error completing file receive:', error);
             this.showToast(`Error saving ${transfer.fileName}: ${error.message}`, 'error');
-            
-            // Try emergency fallback - download in smaller pieces
-            this.emergencyChunkedDownload(transfer);
+            this.removeProgressUI(message.transferId);
         } finally {
-            // Clean up transfer data to free memory
             setTimeout(() => {
                 this.transfers.delete(message.transferId);
-                // Allow page unload if no more transfers
                 this.allowUnload();
             }, 2000);
         }
     }
-    
-    async saveFileDirectly(transfer) {
-        console.log('[P2P] 💾 Saving file directly without creating large blob in memory...');
-        
-        const handle = await window.showSaveFilePicker({
-            suggestedName: transfer.fileName,
-            types: [{
-                description: 'File',
-                accept: { [transfer.fileType || '*/*']: [this.getFileExtension(transfer.fileName)] }
-            }]
-        });
-        
-        const writable = await handle.createWritable();
-        
-        // Write chunks directly to disk without creating a single large blob
-        let written = 0;
-        for (let i = 0; i < transfer.chunks.length; i++) {
-            await writable.write(transfer.chunks[i]);
-            written += transfer.chunks[i].byteLength;
-            
-            if (i % 100 === 0) {
-                const progress = (written / transfer.fileSize) * 100;
-                console.log(`[P2P] Writing to disk: ${progress.toFixed(1)}%`);
-            }
-        }
-        
-        await writable.close();
-        console.log('[P2P] ✅ File written directly to disk successfully!');
-    }
-
-    emergencyChunkedDownload(transfer) {
-        console.log('[P2P] 🚨 Emergency chunked download mode activated');
-        
-        try {
-            // For very large files that cause memory issues, download in parts
-            const maxChunkSize = 50 * 1024 * 1024; // 50MB per download part
-            const totalSize = transfer.fileSize;
-            let offset = 0;
-            let partNumber = 1;
-            
-            // Use a delay between downloads to avoid overwhelming the browser
-            const downloadNextPart = () => {
-                if (offset >= transfer.chunks.length) {
-                    this.showToast(`File downloaded in ${partNumber - 1} parts. Combine them to get the full file.`, 'warning');
-                    // Remove progress UI
-                    setTimeout(() => {
-                        this.removeProgressUI(transfer.transferId || 'unknown');
-                    }, 1000);
-                    return;
-                }
-                
-                let currentSize = 0;
-                const partChunks = [];
-                
-                // Collect chunks up to maxChunkSize
-                while (offset < transfer.chunks.length && currentSize < maxChunkSize) {
-                    const chunk = transfer.chunks[offset];
-                    partChunks.push(chunk);
-                    currentSize += chunk.byteLength;
-                    offset++;
-                }
-                
-                // Create and download this part
-                const partBlob = new Blob(partChunks, { type: 'application/octet-stream' });
-                const fileName = transfer.fileName;
-                const baseName = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
-                const extension = fileName.substring(fileName.lastIndexOf('.')) || '';
-                const partFileName = `${baseName}.part${partNumber}${extension}`;
-                
-                console.log(`[P2P] Downloading part ${partNumber}: ${partBlob.size} bytes`);
-                this.triggerDownload(partBlob, partFileName);
-                
-                partNumber++;
-                
-                // Download next part after a delay (2 seconds between parts)
-                setTimeout(downloadNextPart, 2000);
-            };
-            
-            // Start downloading parts
-            downloadNextPart();
-            
-        } catch (error) {
-            console.error('[P2P] Emergency download also failed:', error);
-            this.showToast('Download failed. Please try a smaller file.', 'error');
-        }
-    }
-
-    async saveFileToDownloads(blob, fileName) {
-        const fileSizeMB = blob.size / (1024 * 1024);
-        console.log(`[P2P] Saving file: ${fileName} (${fileSizeMB.toFixed(2)} MB)`);
-        
-        try {
-            // For very large files on mobile, use File System Access API if available
-            // This is more reliable for large files as it streams to disk
-            if ('showSaveFilePicker' in window && fileSizeMB > 100) {
-                console.log('[P2P] Large file detected, attempting File System Access API...');
-                try {
-                    const handle = await window.showSaveFilePicker({
-                        suggestedName: fileName,
-                        types: [{
-                            description: 'File',
-                            accept: { [blob.type || '*/*']: [this.getFileExtension(fileName)] }
-                        }]
-                    });
-                    
-                    console.log('[P2P] Writing file to disk in chunks...');
-                    const writable = await handle.createWritable();
-                    
-                    // Write in chunks for large files to avoid memory issues
-                    const chunkSize = 10 * 1024 * 1024; // 10MB chunks
-                    let offset = 0;
-                    
-                    while (offset < blob.size) {
-                        const chunk = blob.slice(offset, offset + chunkSize);
-                        await writable.write(chunk);
-                        offset += chunkSize;
-                        
-                        const progress = Math.min(100, (offset / blob.size) * 100);
-                        console.log(`[P2P] Writing to disk: ${progress.toFixed(1)}%`);
-                    }
-                    
-                    await writable.close();
-                    console.log('[P2P] ✅ File saved successfully using File System Access API');
-                    return; // Success, exit
-                } catch (fsError) {
-                    if (fsError.name === 'AbortError') {
-                        console.log('[P2P] User cancelled save dialog');
-                        this.showToast('Download cancelled by user', 'info');
-                        return; // User cancelled, don't fallback
-                    }
-                    console.log('[P2P] File System Access failed, using fallback:', fsError.message);
-                }
-            }
-            
-            // Fallback to traditional download method
-            console.log('[P2P] Using traditional download method');
-            
-            // For mobile browsers with large files, warn user
-            if (fileSizeMB > 500 && this.isMobileBrowser()) {
-                this.showToast('Large file - download may take a moment...', 'warning');
-            }
-            
-            this.triggerDownload(blob, fileName);
-        } catch (error) {
-            console.error('[P2P] Error saving file:', error);
-            
-            // Check if it's a memory error
-            if (error.message && (error.message.includes('memory') || error.message.includes('quota'))) {
-                console.log('[P2P] Memory error detected, attempting emergency chunked download');
-                throw error; // Let completeFileReceive catch this and use emergencyChunkedDownload
-            }
-            
-            // Last resort - still try to download
-            this.triggerDownload(blob, fileName);
-        }
-    }
-    
-    isMobileBrowser() {
-        return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    }
 
     triggerDownload(blob, fileName) {
-        console.log(`[P2P] 💾 Triggering download for: ${fileName} (${(blob.size / (1024 * 1024)).toFixed(2)} MB)`);
-        
-        try {
-            // Force download by using application/octet-stream
-            const downloadBlob = new Blob([blob], { type: 'application/octet-stream' });
-            const url = URL.createObjectURL(downloadBlob);
-            
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileName;
-            a.style.display = 'none';
-            a.style.position = 'fixed';
-            a.style.left = '-9999px';
-            
-            // Multiple attributes to ensure download
-            a.setAttribute('download', fileName);
-            
-            // CRITICAL: Don't use target="_blank" on mobile - causes navigation issues
-            // Don't use target at all to prevent any navigation
-            a.rel = 'noopener noreferrer';
-            
-            document.body.appendChild(a);
-            
-            console.log(`[P2P] Download element created and added to DOM`);
-            
-            // Prevent any navigation events
-            a.addEventListener('click', (e) => {
-                console.log('[P2P] Download link clicked, preventing navigation...');
-                // Don't prevent default - we need the download to work
-                // But stop propagation to prevent any parent handlers
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-            }, { once: true, capture: true });
-            
-            // Use setTimeout to ensure the element is in the DOM
-            setTimeout(() => {
-                try {
-                    console.log('[P2P] Triggering download click...');
-                    
-                    // Create and dispatch a proper mouse event
-                    const clickEvent = new MouseEvent('click', {
-                        view: window,
-                        bubbles: false,
-                        cancelable: true
-                    });
-                    
-                    a.dispatchEvent(clickEvent);
-                    console.log('[P2P] ✅ Download triggered successfully');
-                    
-                    // Show success message
-                    this.showToast('Download started! Check your downloads folder.', 'success');
-                } catch (error) {
-                    console.error('[P2P] ❌ Error triggering download:', error);
-                    this.showToast('Download failed. Please try again.', 'error');
-                }
-                
-                // Clean up after a longer delay for large files
-                // On mobile, keep the element longer to ensure download completes
-                const cleanupDelay = this.isMobileBrowser() 
-                    ? (blob.size > 100 * 1024 * 1024 ? 10000 : 5000)
-                    : (blob.size > 100 * 1024 * 1024 ? 5000 : 1000);
-                    
-                console.log(`[P2P] Will cleanup in ${cleanupDelay}ms`);
-                    
-                setTimeout(() => {
-                    if (document.body.contains(a)) {
-                        document.body.removeChild(a);
-                        console.log('[P2P] Download element removed from DOM');
-                    }
-                    URL.revokeObjectURL(url);
-                    console.log('[P2P] Blob URL revoked');
-                }, cleanupDelay);
-            }, 150);
-        } catch (error) {
-            console.error('[P2P] ❌ Fatal error in triggerDownload:', error);
-            this.showToast('Download failed: ' + error.message, 'error');
-        }
-    }
-
-    getFileExtension(fileName) {
-        const parts = fileName.split('.');
-        return parts.length > 1 ? '.' + parts[parts.length - 1] : '';
+        // No extra Blob wrapping — that would double memory usage
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        // Keep the URL alive long enough for the browser to start the download,
+        // then revoke to free memory
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 60000);
     }
 
     createProgressUI(transferId, fileName) {
