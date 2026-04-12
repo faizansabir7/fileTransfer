@@ -23,6 +23,10 @@ HOST_EXPIRY_SECONDS = 45  # Remove hosts not seen in 45s (3 missed heartbeats)
 server_port = 8080          # set in main()
 https_server_port = None    # set after HTTPS server starts successfully
 
+# Cloud mode: set PUBLIC_URL env var to the Netlify frontend URL.
+# When set, the server skips local IP/HTTPS logic and returns PUBLIC_URL in all responses.
+PUBLIC_URL = os.environ.get('PUBLIC_URL', '').rstrip('/')
+
 
 class FileShareHandler(http.server.SimpleHTTPRequestHandler):
     shared_files    = {}  # {fileId: {name, size, type, host_id}}
@@ -83,13 +87,17 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
             data = self._read_json()
             name = (data.get('name') or 'Unknown Device').strip()[:50]
             host_id = 'host_' + uuid.uuid4().hex[:12]
-            local_ip = self.get_local_ip()
 
-            # Prefer HTTPS URL so that Safari/iOS clients can connect
-            if https_server_port:
-                srv_url = f'https://{local_ip}:{https_server_port}'
+            # Cloud mode: use the public Netlify URL so all clients reach the same server
+            if PUBLIC_URL:
+                srv_url = PUBLIC_URL
             else:
-                srv_url = f'http://{local_ip}:{server_port}'
+                local_ip = self.get_local_ip()
+                # Prefer HTTPS URL so that Safari/iOS clients can connect
+                if https_server_port:
+                    srv_url = f'https://{local_ip}:{https_server_port}'
+                else:
+                    srv_url = f'http://{local_ip}:{server_port}'
 
             with self._lock:
                 self.registered_hosts[host_id] = {
@@ -260,16 +268,24 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
 
     def handle_network_info(self):
         try:
-            local_ip = self.get_local_ip()
-            http_url  = f'http://{local_ip}:{server_port}'
-            info = {
-                'local_ip':   local_ip,
-                'server_url': http_url,
-                'status':     'running',
-            }
-            if https_server_port:
-                info['https_url'] = f'https://{local_ip}:{https_server_port}'
-            self.send_json_response(info)
+            if PUBLIC_URL:
+                # Cloud mode: all devices use the public URL
+                self.send_json_response({
+                    'local_ip':   '',
+                    'server_url': PUBLIC_URL,
+                    'https_url':  PUBLIC_URL,
+                    'status':     'running',
+                })
+            else:
+                local_ip = self.get_local_ip()
+                info = {
+                    'local_ip':   local_ip,
+                    'server_url': f'http://{local_ip}:{server_port}',
+                    'status':     'running',
+                }
+                if https_server_port:
+                    info['https_url'] = f'https://{local_ip}:{https_server_port}'
+                self.send_json_response(info)
         except Exception as e:
             self.send_error(500, str(e))
 
@@ -381,50 +397,61 @@ def get_available_port(start=8080):
 def main():
     global server_port
     try:
-        server_port = get_available_port(8080)
+        # Render (and most cloud hosts) set the PORT env var
+        env_port = os.environ.get('PORT')
+        server_port = int(env_port) if env_port else get_available_port(8080)
 
         class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
             daemon_threads = True
+            allow_reuse_address = True
             def server_bind(self):
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 super().server_bind()
 
         with Server(('', server_port), FileShareHandler) as httpd:
-            local_ip = FileShareHandler.get_local_ip(None)
 
-            # ── Try to start HTTPS server ──────────────────────────────────────
-            https_started = False
-            try:
-                cert_file, key_file = generate_self_signed_cert(local_ip)
-                https_port_candidate = get_available_port(8443)
-                https_thread = threading.Thread(
-                    target=run_https_server,
-                    args=(https_port_candidate, cert_file, key_file),
-                    daemon=True,
-                )
-                https_thread.start()
-                # Give the HTTPS thread a moment to bind and set https_server_port
-                time.sleep(0.8)
-                https_started = (https_server_port is not None)
-            except Exception as e:
-                print(f'[HTTPS] Could not start ({e})')
-
-            # ── Print startup info ─────────────────────────────────────────────
             print('=' * 60)
             print('P2P File Share Server')
             print('=' * 60)
-            print(f'Local (host device):  http://localhost:{server_port}')
-            print(f'HTTP:                 http://{local_ip}:{server_port}')
-            if https_started:
-                print(f'HTTPS (for Safari):   https://{local_ip}:{https_server_port}')
-                print()
-                print('Safari / iOS users must open the HTTPS URL.')
-                print('On first visit, tap "Advanced" → "visit this website"')
-                print('to accept the self-signed certificate.')
+
+            if PUBLIC_URL:
+                # ── Cloud mode ─────────────────────────────────────────────────
+                print(f'Mode:    Cloud (Netlify + Render)')
+                print(f'Port:    {server_port}')
+                print(f'Public:  {PUBLIC_URL}')
+                print('HTTPS handled by Netlify — no local cert needed.')
             else:
-                print()
-                print('WARNING: HTTPS unavailable — Safari/iOS may not work.')
-                print('(Install openssl and restart to enable HTTPS.)')
+                # ── Local mode ─────────────────────────────────────────────────
+                local_ip = FileShareHandler.get_local_ip(None)
+                print(f'Local (host device):  http://localhost:{server_port}')
+                print(f'HTTP:                 http://{local_ip}:{server_port}')
+
+                https_started = False
+                try:
+                    cert_file, key_file = generate_self_signed_cert(local_ip)
+                    https_port_candidate = get_available_port(8443)
+                    https_thread = threading.Thread(
+                        target=run_https_server,
+                        args=(https_port_candidate, cert_file, key_file),
+                        daemon=True,
+                    )
+                    https_thread.start()
+                    time.sleep(0.8)
+                    https_started = (https_server_port is not None)
+                except Exception as e:
+                    print(f'[HTTPS] Could not start ({e})')
+
+                if https_started:
+                    print(f'HTTPS (for Safari):   https://{local_ip}:{https_server_port}')
+                    print()
+                    print('Safari / iOS users must open the HTTPS URL.')
+                    print('On first visit, tap "Advanced" → "visit this website"')
+                    print('to accept the self-signed certificate.')
+                else:
+                    print()
+                    print('WARNING: HTTPS unavailable — Safari/iOS may not work.')
+                    print('(Install openssl and restart to enable HTTPS.)')
+
             print('=' * 60)
             print('Press Ctrl+C to stop\n')
 
