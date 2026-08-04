@@ -2,33 +2,60 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Local File Share</title>
-    <link rel="stylesheet" href="style.css?v=2">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>QuickShare · Local File Transfer</title>
+    <link rel="stylesheet" href="style.css?v=3">
     <link rel="manifest" href="manifest.json">
-    <meta name="theme-color" content="#4CAF50">
+    <meta name="theme-color" content="#4f46e5">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%234f46e5'/%3E%3Cpath d='M50 26v34M36 44l14-14 14 14' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M30 62v6a6 6 0 0 0 6 6h28a6 6 0 0 0 6-6v-6' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>Local File Share</h1>
-            <p>Share files without internet - Local Network Only</p>
+        <header class="app-header">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">
+                    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 5v10"/>
+                        <path d="M8 9l4-4 4 4"/>
+                        <path d="M6 15v2a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/>
+                    </svg>
+                </span>
+                <div class="brand-text">
+                    <h1>QuickShare</h1>
+                    <p>Peer-to-peer file transfer over your local network</p>
+                </div>
+            </div>
+            <span class="privacy-pill" title="Files never leave your local network">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                Local only
+            </span>
         </header>
 
         <div class="network-info">
             <div class="info-card">
-                <h3>Network Status</h3>
+                <div class="info-card-head">
+                    <span class="info-card-icon" aria-hidden="true">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
+                    </span>
+                    <h3>Network Status</h3>
+                </div>
                 <div id="networkStatus">Checking connection...</div>
                 <div id="serverUrl" class="server-url"></div>
             </div>
         </div>
 
-        <div class="mode-selector">
-            <button id="hostBtn" class="mode-btn active">
+        <div class="mode-selector" role="tablist">
+            <button id="hostBtn" class="mode-btn active" role="tab">
+                <span class="mode-btn-icon" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/><path d="M12 3v13"/><path d="M8 7l4-4 4 4"/></svg>
+                </span>
                 <span class="mode-btn-title">Host Files</span>
                 <small>Share files from this device</small>
             </button>
-            <button id="clientBtn" class="mode-btn">
+            <button id="clientBtn" class="mode-btn" role="tab">
+                <span class="mode-btn-icon" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2"/><path d="M12 21V8"/><path d="M8 17l4 4 4-4"/></svg>
+                </span>
                 <span class="mode-btn-title">Connect to Host</span>
                 <small>Receive files from another device</small>
             </button>
@@ -39,7 +66,7 @@
 
             <!-- Step 1: Enter name -->
             <div id="hostNameSetup" class="host-name-setup">
-                <p class="setup-hint">Enter a name so other devices can identify you on the network</p>
+                <p class="setup-hint">Enter a name so other devices can identify you on the network.</p>
                 <div class="input-group">
                     <input type="text" id="hostName" placeholder="e.g. John's Laptop" maxlength="50" autocomplete="off">
                     <button id="startHostingBtn">Start Hosting</button>
@@ -50,13 +77,14 @@
             <!-- Step 2: Hosting active -->
             <div id="hostingActive" style="display: none;">
                 <div class="hosting-badge">
-                    Hosting as <strong id="hostingNameDisplay"></strong>
+                    <span class="hosting-live" aria-hidden="true"></span>
+                    <span class="hosting-badge-text">Hosting as <strong id="hostingNameDisplay"></strong></span>
                     <button id="stopHostingBtn" class="link-btn">Stop</button>
                 </div>
 
                 <div class="upload-area" id="uploadArea">
                     <div class="upload-icon">
-                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                             <polyline points="17 8 12 3 7 8"/>
                             <line x1="12" y1="3" x2="12" y2="15"/>
@@ -72,7 +100,7 @@
                 <div id="fileList" class="file-list"></div>
 
                 <div class="share-info" id="shareInfo" style="display: none;">
-                    <h3>Share this URL with other devices:</h3>
+                    <h3>Share this link with other devices</h3>
                     <div class="url-display">
                         <input type="text" id="shareUrl" readonly>
                         <button id="copyBtn">Copy</button>
@@ -89,7 +117,10 @@
             <div class="discovery-section">
                 <div class="discovery-header">
                     <h3>Available Hosts</h3>
-                    <button id="refreshHostsBtn" class="btn-refresh">Refresh</button>
+                    <button id="refreshHostsBtn" class="btn-refresh">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                        Refresh
+                    </button>
                 </div>
                 <div id="hostsList" class="hosts-list">
                     <div class="discovering">Searching for hosts...</div>
@@ -107,7 +138,10 @@
                     <button id="connectBtn">Connect</button>
                 </div>
                 <div class="scan-option">
-                    <button id="scanBtn">Scan QR Code</button>
+                    <button id="scanBtn" class="btn-secondary">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3M21 14v.01M14 21h.01M17 21h4v-4"/></svg>
+                        Scan QR Code
+                    </button>
                 </div>
             </div>
 
@@ -120,6 +154,10 @@
 
             <div id="availableFiles" class="available-files"></div>
         </div>
+
+        <footer class="app-footer">
+            No internet required · Files transfer directly between devices
+        </footer>
     </div>
 
     <!-- Camera Modal for QR Scanning -->
@@ -134,6 +172,6 @@
 
     <script src="qrcode.min.js"></script>
     <script src="jsqr.js"></script>
-    <script src="script.js?v=7"></script>
+    <script src="script.js?v=8"></script>
 </body>
 </html>
