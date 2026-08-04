@@ -8,6 +8,8 @@ Serves both HTTP (port 8080) and HTTPS (port 8443) for Safari/iOS compatibility.
 import http.server
 import socketserver
 import json
+import re
+import shutil
 import socket
 import time
 import threading
@@ -19,6 +21,8 @@ import subprocess
 import tempfile
 
 HOST_EXPIRY_SECONDS = 45  # Remove hosts not seen in 45s (3 missed heartbeats)
+RELAY_TTL_SECONDS   = 1800  # Relayed files are deleted 30 min after last use
+RELAY_DIR = tempfile.mkdtemp(prefix='fileshare_relay_')
 
 server_port = 8080          # set in main()
 https_server_port = None    # set after HTTPS server starts successfully
@@ -32,6 +36,7 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
     shared_files    = {}  # {fileId: {name, size, type, host_id}}
     registered_hosts = {}  # {hostId: {name, ip, server_url, last_seen}}
     peer_inboxes    = {}  # {peerId: [messages]}
+    relay_files     = {}  # {relayId: {path, name, size, time}}
     _lock = threading.Lock()
 
     def do_GET(self):
@@ -49,6 +54,12 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == '/api/hosts':
             self.handle_hosts_list()
             return
+        elif self.path == '/api/relay-info':
+            self.handle_relay_info()
+            return
+        elif self.path.startswith('/api/relay-download/'):
+            self.handle_relay_download()
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -60,6 +71,8 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_register_host()
         elif self.path == '/api/heartbeat':
             self.handle_heartbeat()
+        elif self.path.startswith('/api/relay-upload/'):
+            self.handle_relay_upload()
         else:
             self.send_error(404)
 
@@ -264,6 +277,133 @@ class FileShareHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
+    # ── LAN Relay (for WebKit receivers) ───────────────────────────────────────
+    # iOS browsers can't stream P2P data to disk (WebKit buffers service-worker
+    # streams, blob downloads AND the share sheet in RAM). What iOS *can* do is
+    # a plain network download of any size. So: the host uploads the file here
+    # over the LAN, the iPhone downloads it as a normal HTTPS download.
+
+    @staticmethod
+    def _relay_id(path):
+        """Extract and sanitize the relay id from a /api/relay-*/<id> path."""
+        raw = path.split('/')[-1].split('?')[0]
+        return re.sub(r'[^A-Za-z0-9_\-]', '', raw)[:80]
+
+    def handle_relay_info(self):
+        """Capability probe: relay available + free temp disk space."""
+        try:
+            free = shutil.disk_usage(RELAY_DIR).free
+            self.send_json_response({'relay': True, 'free': free})
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_relay_upload(self):
+        """Host streams a shared file's bytes here (1 MB chunks, disk only)."""
+        try:
+            rid = self._relay_id(self.path)
+            if not rid:
+                self.send_error(400, 'Bad relay id')
+                return
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = (params.get('name', ['download'])[0] or 'download')[:255]
+
+            length = int(self.headers.get('Content-Length', 0))
+            if length <= 0:
+                self.send_error(400, 'Missing Content-Length')
+                return
+
+            path = os.path.join(RELAY_DIR, rid)
+            remaining = length
+            with open(path, 'wb') as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+
+            if remaining != 0:
+                os.remove(path)
+                self.send_error(400, 'Incomplete upload')
+                return
+
+            with self._lock:
+                self.relay_files[rid] = {
+                    'path': path, 'name': name, 'size': length, 'time': time.time(),
+                }
+            print(f"[Relay] Staged '{name}' ({self.fmt_size(length)}) as {rid}")
+            self.send_json_response({'status': 'ok'})
+        except Exception as e:
+            print(f"[Relay] Upload error: {e}")
+            self.send_error(500, str(e))
+
+    def handle_relay_download(self):
+        """Serve a staged file as a native browser download (streams from disk).
+
+        Supports HTTP Range requests — iOS Safari's download manager pauses
+        and resumes big downloads with Range, so without this, any hiccup or
+        app switch mid-download kills the whole thing.
+        """
+        rid = self._relay_id(self.path)
+        with self._lock:
+            entry = self.relay_files.get(rid)
+            if entry:
+                entry['time'] = time.time()  # extend TTL while in use
+        if not entry or not os.path.exists(entry['path']):
+            self.send_error(404, 'Relay file not found or expired')
+            return
+
+        size = entry['size']
+        start, end = 0, size - 1
+        status = 200
+
+        range_header = (self.headers.get('Range') or '').strip()
+        if range_header:
+            m = re.match(r'bytes=(\d*)-(\d*)$', range_header)
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), size - 1)
+                else:
+                    # suffix range: last N bytes
+                    start = max(0, size - int(m.group(2)))
+                if start >= size or start > end:
+                    self.send_response(416)
+                    self.send_header('Content-Range', f'bytes */{size}')
+                    self.end_headers()
+                    return
+                status = 206
+
+        try:
+            quoted = urllib.parse.quote(entry['name'])
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(end - start + 1))
+            if status == 206:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            self.send_header('Content-Disposition', f"attachment; filename*=UTF-8''{quoted}")
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            with open(entry['path'], 'rb') as f:
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            if status == 206:
+                print(f"[Relay] Served bytes {start}-{end} of '{entry['name']}' to {self.client_address[0]}")
+            else:
+                print(f"[Relay] Served '{entry['name']}' to {self.client_address[0]}")
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"[Relay] Client disconnected while downloading '{entry['name']}'")
+
     # ── Network Info ───────────────────────────────────────────────────────────
 
     def handle_network_info(self):
@@ -381,6 +521,25 @@ def run_https_server(port, cert_file, key_file):
         print(f'[HTTPS] Server error: {e}')
 
 
+# ── Relay cleanup ──────────────────────────────────────────────────────────────
+
+def relay_cleanup_loop():
+    """Delete relayed files that haven't been touched in RELAY_TTL_SECONDS."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with FileShareHandler._lock:
+            expired = [rid for rid, r in FileShareHandler.relay_files.items()
+                       if now - r['time'] > RELAY_TTL_SECONDS]
+            entries = [FileShareHandler.relay_files.pop(rid) for rid in expired]
+        for r in entries:
+            try:
+                os.remove(r['path'])
+                print(f"[Relay] Expired '{r['name']}'")
+            except OSError:
+                pass
+
+
 # ── Port helpers ───────────────────────────────────────────────────────────────
 
 def get_available_port(start=8080):
@@ -400,6 +559,8 @@ def main():
         # Render (and most cloud hosts) set the PORT env var
         env_port = os.environ.get('PORT')
         server_port = int(env_port) if env_port else get_available_port(8080)
+
+        threading.Thread(target=relay_cleanup_loop, daemon=True).start()
 
         class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
             daemon_threads = True

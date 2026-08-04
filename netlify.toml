@@ -11,5 +11,6 @@
 [[headers]]
   for = "/*"
   [headers.values]
-    X-Frame-Options        = "DENY"
+    # SAMEORIGIN (not DENY): streaming downloads use a hidden same-origin iframe
+    X-Frame-Options        = "SAMEORIGIN"
     X-Content-Type-Options = "nosniff"

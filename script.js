@@ -18,8 +18,17 @@ class LocalFileShare {
         this.currentTargetHostId = null; // hostId of the host we're connected to
 
         // File transfer state
-        this.transfers = new Map(); // Map of transferId -> transfer object
-        this.pendingWritables = new Map(); // fileId -> {writable, writeQueue} — set before transfer starts
+        // Receiver side: one active transfer at a time (data channel is ordered,
+        // so interleaved transfers would corrupt) + a queue of pending downloads.
+        this.receiveState = { active: null, queue: [] };
+        // Host side: serialize sends per peer + flow-control state per transfer
+        this.sendQueues = new Map();  // peerId -> [{fileId, transferId}]
+        this.sendActive = new Set();  // peerIds with a send loop running
+        this.sendStates = new Map();  // transferId -> {acked, aborted, ackWaiter}
+        this.channelWaiters = new Map(); // peerId -> [{resolve, reject}] waiting for channel open
+        this.swKeepaliveTimer = null;
+        this.fastPollUntil = 0; // poll signaling fast while negotiation is active
+        this.wakeLock = null;   // screen wake lock during transfers (phones)
 
         // Keep-alive intervals for connections
         this.keepAliveIntervals = new Map(); // Map of peerId -> interval
@@ -32,6 +41,15 @@ class LocalFileShare {
 
     async init() {
         this.setupEventListeners();
+        this._cleanupOpfsLeftovers(); // remove staged downloads from crashed sessions
+
+        // Phones drop the wake lock when the tab is hidden — re-acquire on return
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && this.receiveState.active) {
+                this._acquireWakeLock();
+            }
+        });
+
         await this.detectNetworkInfo();
 
         // Start in host mode by default (this will set peer ID)
@@ -62,6 +80,12 @@ class LocalFileShare {
         const uploadArea = document.getElementById('uploadArea');
 
         fileInput.addEventListener('change', (e) => this.handleFiles(e.target.files));
+
+        // Fallback for browsers where the invisible file-input overlay doesn't
+        // receive the tap (the overlay handles it natively everywhere else).
+        uploadArea.addEventListener('click', (e) => {
+            if (e.target !== fileInput) fileInput.click();
+        });
 
         uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
@@ -103,9 +127,11 @@ class LocalFileShare {
             btn.textContent = isHidden ? 'Hide manual connect' : 'Enter URL manually';
         });
 
-        // Service Worker for offline functionality
+        // Service Worker: offline cache + streaming downloads to disk
         if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('sw.js').catch(console.error);
+            navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+                .then((reg) => reg.update().catch(() => {}))
+                .catch(console.error);
         }
     }
 
@@ -389,13 +415,14 @@ class LocalFileShare {
         item.innerHTML = `
             <div class="file-icon">${this.getFileIcon(file.type)}</div>
             <div class="file-info">
-                <div class="file-name">${file.name}</div>
+                <div class="file-name">${this._escapeHtml(file.name)}</div>
                 <div class="file-size">${this.formatFileSize(file.size)}</div>
             </div>
             <div class="file-actions">
-                <button class="btn danger" onclick="fileShare.removeFile('${fileId}')">Remove</button>
+                <button class="btn danger">Remove</button>
             </div>
         `;
+        item.querySelector('.btn.danger').addEventListener('click', () => this.removeFile(fileId));
         return item;
     }
 
@@ -445,7 +472,10 @@ class LocalFileShare {
             // Check if QRCode library is available
             if (typeof QRCode !== 'undefined') {
                 try {
-                    QRCode.toCanvas(qrCode, this.serverUrl, {
+                    // toCanvas needs an actual <canvas>, not the container div
+                    const canvas = document.createElement('canvas');
+                    qrCode.appendChild(canvas);
+                    QRCode.toCanvas(canvas, this.serverUrl, {
                         width: 200,
                         margin: 2,
                         color: {
@@ -513,20 +543,29 @@ class LocalFileShare {
 
         this.isPolling = true;
         console.log('[P2P] Starting signaling poll');
-        this.pollSignaling();
 
-        // Poll every 800ms for fast ICE/signaling exchange
-        this.signalingPollInterval = setInterval(() => {
-            this.pollSignaling();
-        }, 800);
+        // Adaptive polling: 400ms while a negotiation is active (fast ICE
+        // exchange), 2.5s when idle (cheap on the signaling server).
+        const loop = async () => {
+            if (!this.isPolling) return;
+            await this.pollSignaling();
+            if (!this.isPolling) return;
+            const delay = Date.now() < this.fastPollUntil ? 400 : 2500;
+            this.signalingPollInterval = setTimeout(loop, delay);
+        };
+        loop();
     }
 
     stopSignalingPoll() {
         if (this.signalingPollInterval) {
-            clearInterval(this.signalingPollInterval);
+            clearTimeout(this.signalingPollInterval);
             this.signalingPollInterval = null;
         }
         this.isPolling = false;
+    }
+
+    bumpFastPoll() {
+        this.fastPollUntil = Date.now() + 30000;
     }
 
     async pollSignaling() {
@@ -536,6 +575,7 @@ class LocalFileShare {
             if (response.ok) {
                 const data = await response.json();
                 if (data.messages && data.messages.length > 0) {
+                    this.bumpFastPoll(); // negotiation in progress — poll fast
                     for (const message of data.messages) {
                         await this.handleSignalingMessage(message);
                     }
@@ -548,6 +588,7 @@ class LocalFileShare {
 
     async sendSignalingMessage(toPeer, type, data) {
         try {
+            this.bumpFastPoll(); // we expect a reply — poll fast for a while
             const message = {
                 from: this.peerId,
                 to: toPeer,
@@ -709,6 +750,13 @@ class LocalFileShare {
             this.dataChannels.set(peerId, dataChannel);
             this.showToast('Data channel ready for file transfer!', 'success');
 
+            // Wake up anyone awaiting this channel (ensureP2P)
+            const waiters = this.channelWaiters.get(peerId);
+            if (waiters) {
+                this.channelWaiters.delete(peerId);
+                waiters.forEach(w => w.resolve(dataChannel));
+            }
+
             // Update P2P status display
             this.updateP2PStatus();
         };
@@ -722,8 +770,18 @@ class LocalFileShare {
 
         dataChannel.onclose = () => {
             console.log(`[P2P] Data channel closed with ${peerId}`);
-            this.dataChannels.delete(peerId);
-            
+            // Only clear the mapping if it still points at THIS channel — a
+            // reconnect may already have installed a fresh one under this key
+            if (this.dataChannels.get(peerId) === dataChannel) {
+                this.dataChannels.delete(peerId);
+
+                // Active download interrupted → resume instead of failing
+                const t = this.receiveState.active;
+                if (t && !t.failed && !this.isHost && peerId === this.currentTargetHostId) {
+                    setTimeout(() => this._attemptResume(t, 'connection lost'), 500);
+                }
+            }
+
             // Update P2P status display
             this.updateP2PStatus();
         };
@@ -914,32 +972,15 @@ class LocalFileShare {
 
         this.showConnectionStatus('Connecting...', 'info');
         this.currentHostUrl = hostUrl;
+        this._relayInfo = undefined; // re-probe relay capability per host
 
         try {
             // Clean up ALL existing P2P connections (force complete fresh start)
             console.log('[P2P] Cleaning up all existing connections for fresh start...');
-            this.peerConnections.forEach((pc, peerId) => {
-                console.log(`[P2P] Closing connection to ${peerId}`);
-                pc.close();
-            });
-            this.peerConnections.clear();
-            this.dataChannels.clear();
-            
-            // Stop all keep-alives
-            this.keepAliveIntervals.forEach((interval, peerId) => {
-                clearInterval(interval);
-            });
-            this.keepAliveIntervals.clear();
-            
-            // Clear reconnecting state
-            this.reconnecting.clear();
-            
+            Array.from(this.peerConnections.keys()).forEach(pid => this.teardownPeer(pid));
+
             // Generate NEW client peer ID to avoid signaling conflicts
-            const oldPeerId = this.peerId;
             this.peerId = this.generatePeerId();
-            console.log(`[P2P] Generated new client peer ID: ${this.peerId} (was ${oldPeerId})`);
-            
-            // Stop and restart signaling
             this.stopSignalingPoll();
 
             const hostPeerId = targetHostId;
@@ -954,16 +995,13 @@ class LocalFileShare {
                 // Load available files
                 await this.loadAvailableFiles();
 
-                // Initiate fresh P2P connection to host
-                console.log('[P2P] Starting fresh P2P connection...');
-                await this.initiateP2PConnection(hostPeerId);
-                
-                this.showToast('P2P connection initiated!', 'info');
-                
                 // Show P2P controls
                 document.getElementById('p2pControls').style.display = 'flex';
-                this.updateP2PStatus();
 
+                // Establish P2P with automatic retries
+                await this.ensureP2P(hostPeerId);
+                this.showConnectionStatus('Connected — P2P ready', 'success');
+                this.showToast('P2P connection established!', 'success');
             } else {
                 throw new Error(`Server responded with ${response.status}`);
             }
@@ -980,76 +1018,18 @@ class LocalFileShare {
         }
         console.log('[P2P] Manual reset requested');
         this.showToast('Resetting P2P connection...', 'info');
-        
-        // Clean up ALL peer connections (not just host)
-        console.log('[P2P] Cleaning up all peer connections...');
-        this.peerConnections.forEach((pc, peerId) => {
-            console.log(`[P2P] Closing connection to ${peerId}`);
-            pc.close();
-        });
-        this.peerConnections.clear();
-        this.dataChannels.clear();
-        
-        // Stop all keep-alives
-        this.keepAliveIntervals.forEach((interval, peerId) => {
-            clearInterval(interval);
-        });
-        this.keepAliveIntervals.clear();
-        
-        // Clear reconnecting state
-        this.reconnecting.clear();
-        
-        // Generate NEW client peer ID to avoid signaling conflicts
-        const oldPeerId = this.peerId;
+
+        // Clean up ALL peer connections and reconnect with a fresh peer ID
+        Array.from(this.peerConnections.keys()).forEach(pid => this.teardownPeer(pid));
         this.peerId = this.generatePeerId();
-        console.log(`[P2P] Generated new client peer ID: ${this.peerId} (was ${oldPeerId})`);
-        
-        // Update status
-        this.updateP2PStatus('disconnected');
-        
-        // Wait a moment for cleanup
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Restart signaling with new peer ID
         this.stopSignalingPoll();
-        
+
         try {
-            // Create fresh connection
-            console.log('[P2P] Creating fresh P2P connection with new peer ID...');
-            this.updateP2PStatus('connecting');
-            
-            await this.initiateP2PConnection(hostPeerId);
-            
-            // Wait for connection to establish
-            let attempts = 0;
-            while (attempts < 20) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                
-                const dc = this.dataChannels.get(hostPeerId);
-                const pc = this.peerConnections.get(hostPeerId);
-                
-                if (dc && dc.readyState === 'open') {
-                    console.log('[P2P] ✅ Reset successful, connection established!');
-                    this.showToast('P2P connection reset successfully!', 'success');
-                    this.updateP2PStatus('connected');
-                    return;
-                }
-                
-                // Show progress
-                if (attempts % 3 === 0) {
-                    console.log(`[P2P] Waiting for connection... (${attempts + 1}/20)`);
-                }
-                
-                attempts++;
-            }
-            
-            // If we get here, connection failed
-            throw new Error('Connection timeout after reset');
-            
+            await this.ensureP2P(hostPeerId);
+            this.showToast('P2P connection re-established!', 'success');
         } catch (error) {
             console.error('[P2P] Reset failed:', error);
             this.showToast('Reset failed: ' + error.message, 'error');
-            this.updateP2PStatus('failed');
         }
     }
     
@@ -1178,13 +1158,16 @@ class LocalFileShare {
                     fileItem.innerHTML = `
                         <div class="file-icon">${this.getFileIcon(file.type)}</div>
                         <div class="file-info">
-                            <div class="file-name">${file.name}</div>
+                            <div class="file-name">${this._escapeHtml(file.name)}</div>
                             <div class="file-size">${this.formatFileSize(file.size)}</div>
                         </div>
-                        <button class="download-btn p2p-btn" onclick="fileShare.downloadFileP2P('${file.id}', '${file.name}', ${file.size})">
-                            P2P Download
-                        </button>
+                        <button class="download-btn p2p-btn">Download</button>
                     `;
+                    // addEventListener instead of inline onclick — filenames with
+                    // quotes would break an inline handler string
+                    fileItem.querySelector('.download-btn').addEventListener('click', () => {
+                        this.downloadFileP2P(file.id, file.name, file.size);
+                    });
                     availableFiles.appendChild(fileItem);
                 });
                 this.showToast(`Found ${data.files.length} file(s) via P2P`);
@@ -1199,6 +1182,508 @@ class LocalFileShare {
 
     // ==================== File Transfer via P2P ====================
 
+    // ── Connection helpers ─────────────────────────────────────────────────
+
+    teardownPeer(peerId) {
+        const pc = this.peerConnections.get(peerId);
+        if (pc) { try { pc.close(); } catch (e) {} }
+        this.peerConnections.delete(peerId);
+        this.dataChannels.delete(peerId);
+        this.stopKeepAlive(peerId);
+        this.reconnecting.delete(peerId);
+        const waiters = this.channelWaiters.get(peerId);
+        if (waiters) {
+            this.channelWaiters.delete(peerId);
+            waiters.forEach(w => w.reject(new Error('Connection torn down')));
+        }
+    }
+
+    waitForChannel(peerId, timeoutMs) {
+        const existing = this.dataChannels.get(peerId);
+        if (existing && existing.readyState === 'open') return Promise.resolve(existing);
+
+        return new Promise((resolve, reject) => {
+            const waiter = {};
+            const timer = setTimeout(() => {
+                const list = this.channelWaiters.get(peerId);
+                if (list) {
+                    const i = list.indexOf(waiter);
+                    if (i !== -1) list.splice(i, 1);
+                }
+                reject(new Error('Timed out waiting for data channel'));
+            }, timeoutMs);
+            waiter.resolve = (dc) => { clearTimeout(timer); resolve(dc); };
+            waiter.reject = (err) => { clearTimeout(timer); reject(err); };
+            const list = this.channelWaiters.get(peerId) || [];
+            list.push(waiter);
+            this.channelWaiters.set(peerId, list);
+        });
+    }
+
+    // Get an open data channel to the host, retrying with a fresh connection
+    // (and fresh peer ID) if negotiation stalls or fails.
+    async ensureP2P(hostPeerId) {
+        let dc = this.dataChannels.get(hostPeerId);
+        if (dc && dc.readyState === 'open') return dc;
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                this.updateP2PStatus('connecting');
+                if (attempt > 0) {
+                    console.log(`[P2P] Retry ${attempt}: reconnecting with fresh peer ID`);
+                    this.teardownPeer(hostPeerId);
+                    this.peerId = this.generatePeerId();
+                    await new Promise(r => setTimeout(r, 600));
+                }
+                await this.initiateP2PConnection(hostPeerId);
+                dc = await this.waitForChannel(hostPeerId, 15000);
+                this.updateP2PStatus('connected');
+                return dc;
+            } catch (e) {
+                console.warn(`[P2P] Connection attempt ${attempt + 1} failed:`, e.message);
+            }
+        }
+        this.updateP2PStatus('failed');
+        throw new Error('Could not establish P2P connection');
+    }
+
+    // ── Download sinks ─────────────────────────────────────────────────────
+    // A sink receives chunks and puts them somewhere safe. Preference order:
+    //   1. Service worker stream → native browser download, direct to disk,
+    //      no size limit (Chrome/Firefox/Edge/Android, needs HTTPS).
+    //      NOT on WebKit: Safari buffers SW-streamed downloads in RAM and iOS
+    //      kills the whole browser around ~0.5 GB — the crash this avoids.
+    //   2. File System Access API → save dialog, streams to disk (Chrome/Edge)
+    //   3. OPFS staging → chunks go to disk-backed browser storage via a
+    //      worker, finished file is handed to the download manager at the end
+    //      (this is the Safari/iPhone path)
+    //   4. In-memory Blob → last resort, limited by RAM
+
+    async createSink(transferId, fileName, fileSize) {
+        // All iOS browsers + macOS Safari report an Apple vendor. WebKit
+        // buffers SW-streamed downloads in RAM, so allow the direct path
+        // there only up to a safe size — bigger files went to the relay
+        // in startReceive, or fall through to staging below.
+        const isWebKit = /^Apple/i.test(navigator.vendor || '');
+        const swAllowed = !isWebKit || (fileSize > 0 && fileSize <= 400 * 1024 * 1024);
+
+        if (swAllowed) {
+            try {
+                const sink = await this._createSwSink(transferId, fileName, fileSize);
+                if (sink) return sink;
+            } catch (e) {
+                console.warn('[DL] Service worker streaming unavailable:', e.message);
+            }
+        }
+
+        try {
+            const sink = await this._createFsSink(fileName);
+            if (sink) return sink;
+        } catch (e) {
+            if (e.name === 'AbortError') throw e; // user cancelled the save dialog
+            console.warn('[DL] File System Access unavailable:', e.message);
+        }
+
+        try {
+            const sink = await this._createOpfsSink(transferId, fileName, fileSize);
+            if (sink) return sink;
+        } catch (e) {
+            console.warn('[DL] OPFS staging unavailable:', e.message);
+        }
+
+        const sizeMB = (fileSize || 0) / (1024 * 1024);
+        if (sizeMB > 500) {
+            this.showToast(
+                `${Math.round(sizeMB)} MB won't fit in this browser's memory reliably. ` +
+                `Free up device storage or update your browser, then retry.`,
+                'warning'
+            );
+        }
+        return this._createMemorySink(fileName);
+    }
+
+    async _createSwSink(transferId, fileName, fileSize) {
+        if (!('serviceWorker' in navigator)) return null;
+        const ctrl = navigator.serviceWorker.controller;
+        if (!ctrl) return null; // SW not controlling this page (first load / HTTP)
+
+        const mc = new MessageChannel();
+        const port = mc.port1;
+        const state = { ackResolve: null, canceled: false };
+
+        let readyResolve, readyReject, startedResolve, startedReject;
+        const ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
+        const started = new Promise((res, rej) => { startedResolve = res; startedReject = rej; });
+
+        port.onmessage = (ev) => {
+            const m = ev.data || {};
+            if (m.type === 'ready') readyResolve(m.url);
+            else if (m.type === 'started') startedResolve();
+            else if (m.type === 'ack' || m.type === 'canceled') {
+                if (m.type === 'canceled') state.canceled = true;
+                const r = state.ackResolve;
+                state.ackResolve = null;
+                if (r) r();
+            }
+        };
+
+        ctrl.postMessage({ type: 'download-init', id: transferId, name: fileName, size: fileSize }, [mc.port2]);
+
+        const readyTimer = setTimeout(() => readyReject(new Error('Service worker did not respond')), 4000);
+        const url = await ready;
+        clearTimeout(readyTimer);
+
+        // Navigating a hidden iframe to the virtual URL makes the browser
+        // treat it as a regular download (shows in the downloads UI).
+        const iframe = document.createElement('iframe');
+        iframe.hidden = true;
+        iframe.src = url;
+        document.body.appendChild(iframe);
+
+        const startTimer = setTimeout(() => startedReject(new Error('Browser did not start the download')), 8000);
+        try {
+            await started;
+        } catch (e) {
+            iframe.remove();
+            port.postMessage({ type: 'abort' });
+            throw e;
+        }
+        clearTimeout(startTimer);
+
+        this._startSwKeepalive();
+        console.log('[DL] Streaming to browser downloads via service worker');
+
+        return {
+            mode: 'sw',
+            // Each write waits for the SW's ack, which follows disk-drain pace —
+            // this is what bounds memory end-to-end.
+            write: (chunk) => {
+                if (state.canceled) return Promise.reject(new Error('Download canceled in browser'));
+                return new Promise((resolve, reject) => {
+                    state.ackResolve = () => state.canceled
+                        ? reject(new Error('Download canceled in browser'))
+                        : resolve();
+                    port.postMessage({ type: 'chunk', data: chunk }, [chunk]);
+                });
+            },
+            close: async () => {
+                port.postMessage({ type: 'end' });
+                setTimeout(() => iframe.remove(), 5000);
+            },
+            abort: async () => {
+                port.postMessage({ type: 'abort' });
+                iframe.remove();
+            },
+        };
+    }
+
+    async _createFsSink(fileName) {
+        if (!window.showSaveFilePicker) return null;
+        const handle = await window.showSaveFilePicker({ suggestedName: fileName });
+        const writable = await handle.createWritable();
+        console.log('[DL] Streaming to disk via File System Access API');
+        return {
+            mode: 'fs',
+            write: (chunk) => writable.write(chunk),
+            close: () => writable.close(),
+            abort: () => writable.abort(),
+        };
+    }
+
+    // OPFS staging: write chunks to origin-private file system (disk, not RAM)
+    // through a worker using the synchronous access API (Safari 16.4+, Chrome,
+    // Firefox). On completion the disk-backed File is handed to the browser's
+    // download manager — memory stays flat no matter the file size.
+    async _createOpfsSink(transferId, fileName, fileSize) {
+        if (!(navigator.storage && navigator.storage.getDirectory) || typeof Worker === 'undefined') {
+            return null;
+        }
+
+        // Best-effort quota preflight so a 2 GB transfer doesn't die at 90%
+        try {
+            const est = await navigator.storage.estimate();
+            if (est && est.quota && fileSize && (est.quota - (est.usage || 0)) < fileSize * 1.05) {
+                throw new Error(`Not enough browser storage for ${this.formatFileSize(fileSize)} — free up space on this device`);
+            }
+        } catch (e) {
+            if (String(e.message).startsWith('Not enough')) throw e;
+            // estimate() itself failed — proceed and let writes surface errors
+        }
+
+        // Stage under the real filename (in a per-transfer folder) so the file
+        // handed to the share sheet / download carries the right name
+        const safeName = fileName.replace(/[\/\\]/g, '_') || 'download';
+        const workerUrl = URL.createObjectURL(new Blob([this._opfsWorkerCode()], { type: 'application/javascript' }));
+        const worker = new Worker(workerUrl);
+        URL.revokeObjectURL(workerUrl);
+
+        // Writes are serialized by the transfer's writeChain, so a single
+        // pending request/response slot is enough.
+        let pending = null;
+        worker.onmessage = (ev) => {
+            const m = ev.data || {};
+            const p = pending;
+            pending = null;
+            if (!p) return;
+            if (m.type === 'error') p.reject(new Error(m.error));
+            else p.resolve(m);
+        };
+        worker.onerror = (ev) => {
+            const p = pending;
+            pending = null;
+            if (p) p.reject(new Error(ev.message || 'OPFS worker error'));
+        };
+        const call = (msg, transferables) => new Promise((resolve, reject) => {
+            pending = { resolve, reject };
+            worker.postMessage(msg, transferables || []);
+        });
+
+        try {
+            await Promise.race([
+                call({ type: 'init', dir: transferId, name: safeName }),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('OPFS init timed out')), 8000)),
+            ]);
+        } catch (e) {
+            worker.terminate();
+            throw e; // e.g. createSyncAccessHandle unsupported → next fallback
+        }
+
+        console.log('[DL] Staging to disk (OPFS) — download appears when transfer completes');
+        let offset = 0;
+
+        return {
+            mode: 'opfs',
+            write: async (chunk) => {
+                const at = offset;
+                offset += chunk.byteLength;
+                await call({ type: 'chunk', data: chunk, offset: at }, [chunk]);
+            },
+            close: async () => {
+                await call({ type: 'close' });
+                worker.terminate();
+
+                const handle = await this._getStagedFileHandle(transferId, safeName);
+                const file = await handle.getFile();
+                // Never hand over a truncated file (silent short writes exist
+                // in private browsing / storage-pressure situations)
+                if (fileSize && file.size !== fileSize) {
+                    throw new Error(`Staged file incomplete (${this.formatFileSize(file.size)} of ${this.formatFileSize(fileSize)}) — device storage may be full`);
+                }
+                this._offerManualSave(transferId, fileName, file, fileSize);
+                return 'manual-save-offered';
+            },
+            abort: async () => {
+                try { await call({ type: 'abort' }); } catch (e) {}
+                worker.terminate();
+                this._removeStagedDir(transferId);
+            },
+        };
+    }
+
+    async _getStagedFileHandle(transferId, safeName) {
+        const root = await navigator.storage.getDirectory();
+        const tmp = await root.getDirectoryHandle('dl_tmp', { create: true });
+        const dir = await tmp.getDirectoryHandle(transferId, { create: true });
+        return dir.getFileHandle(safeName);
+    }
+
+    async _removeStagedDir(transferId) {
+        try {
+            const root = await navigator.storage.getDirectory();
+            const tmp = await root.getDirectoryHandle('dl_tmp');
+            await tmp.removeEntry(transferId, { recursive: true });
+        } catch (e) { /* already gone */ }
+    }
+
+    // After an OPFS transfer completes, turn its progress card into a save
+    // card. On iOS the primary action is the share sheet ("Save to Files") —
+    // blob-URL downloads on WebKit buffer in RAM and die at a few hundred MB,
+    // while the share sheet copies the disk-backed file through the OS.
+    _offerManualSave(transferId, fileName, file, fileSize) {
+        // Wrap to guarantee a proper name/type — a metadata-level reference,
+        // not a data copy
+        const shareFile = new File([file], fileName, { type: file.type || 'application/octet-stream' });
+        const canShare = !!(navigator.share && navigator.canShare &&
+                            navigator.canShare({ files: [shareFile] }));
+        const isWebKit = /^Apple/i.test(navigator.vendor || '');
+
+        let url = null;
+        const getUrl = () => {
+            if (!url) url = URL.createObjectURL(shareFile);
+            return url;
+        };
+        const cleanup = () => {
+            if (url) { URL.revokeObjectURL(url); url = null; }
+            this._removeStagedDir(transferId);
+        };
+
+        // Auto-trigger a normal download only where it's reliable: non-WebKit
+        // browsers, or small files. Large WebKit blob downloads are the
+        // "download failed and cannot be retried" path.
+        if (!isWebKit || !fileSize || fileSize < 200 * 1024 * 1024) {
+            const a = document.createElement('a');
+            a.href = getUrl();
+            a.download = fileName;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => a.remove(), 5000);
+        }
+
+        const el = document.getElementById(`progress-${transferId}`);
+        if (!el) {
+            setTimeout(cleanup, 15 * 60 * 1000);
+            return;
+        }
+
+        const hint = canShare
+            ? 'Tap "Save to Files" and pick a location — works for any size.'
+            : "If the save prompt didn't appear or failed, save it again — no re-download needed.";
+        el.innerHTML = `
+            <div class="progress-header">
+                <span class="progress-filename">${this._escapeHtml(fileName)}</span>
+                <span class="progress-percentage">✓</span>
+            </div>
+            <div class="progress-details"><span>${hint}</span></div>
+            <div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">
+                ${canShare ? '<button class="btn p2p-btn manual-share-btn" style="padding:10px 20px; font-weight:600;">Save to Files</button>' : ''}
+                <a class="btn manual-save-btn" href="${getUrl()}" download="${this._escapeHtml(fileName)}"
+                   style="text-decoration:none; padding:10px 20px; border-radius:6px;">${canShare ? 'Normal download' : 'Save again'}</a>
+                <button class="btn manual-save-dismiss" style="padding:10px 20px;">Done</button>
+            </div>
+        `;
+
+        const shareBtn = el.querySelector('.manual-share-btn');
+        if (shareBtn) {
+            shareBtn.addEventListener('click', async () => {
+                try {
+                    await navigator.share({ files: [shareFile], title: fileName });
+                    this.showToast(`${fileName} handed to the system — done!`, 'success');
+                } catch (e) {
+                    if (e.name !== 'AbortError') {
+                        this.showToast('Share failed: ' + e.message, 'error');
+                    }
+                }
+            });
+        }
+        el.querySelector('.manual-save-dismiss').addEventListener('click', () => {
+            this.removeProgressUI(transferId);
+            // Give an in-flight save started from this card time to finish
+            setTimeout(cleanup, 60 * 1000);
+        });
+
+        // Auto-reclaim staged space if the user never dismisses
+        setTimeout(() => {
+            if (document.getElementById(`progress-${transferId}`)) {
+                this.removeProgressUI(transferId);
+            }
+            cleanup();
+        }, 15 * 60 * 1000);
+    }
+
+    _opfsWorkerCode() {
+        return `
+            let access = null;
+            self.onmessage = async (e) => {
+                const m = e.data;
+                try {
+                    if (m.type === 'init') {
+                        const root = await navigator.storage.getDirectory();
+                        const tmp = await root.getDirectoryHandle('dl_tmp', { create: true });
+                        const dir = await tmp.getDirectoryHandle(m.dir, { create: true });
+                        const handle = await dir.getFileHandle(m.name, { create: true });
+                        access = await handle.createSyncAccessHandle();
+                        access.truncate(0);
+                        self.postMessage({ type: 'ready' });
+                    } else if (m.type === 'chunk') {
+                        const n = access.write(new Uint8Array(m.data), { at: m.offset });
+                        // Short write = storage full (some browsers truncate
+                        // silently instead of throwing, e.g. private browsing)
+                        if (n < m.data.byteLength) {
+                            throw new Error('Device storage full — could not write chunk');
+                        }
+                        self.postMessage({ type: 'ack' });
+                    } else if (m.type === 'close') {
+                        access.flush();
+                        access.close();
+                        access = null;
+                        self.postMessage({ type: 'closed' });
+                    } else if (m.type === 'abort') {
+                        try { if (access) access.close(); } catch (err) {}
+                        access = null;
+                        self.postMessage({ type: 'aborted' });
+                    }
+                } catch (err) {
+                    self.postMessage({ type: 'error', error: err.message || String(err) });
+                }
+            };
+        `;
+    }
+
+    async _cleanupOpfsLeftovers() {
+        try {
+            if (!(navigator.storage && navigator.storage.getDirectory)) return;
+            const root = await navigator.storage.getDirectory();
+            for await (const name of root.keys()) {
+                // 'dl_tmp' dir (current layout) + legacy 'dl_*' files
+                if (name === 'dl_tmp' || name.startsWith('dl_')) {
+                    await root.removeEntry(name, { recursive: true }).catch(() => {});
+                }
+            }
+        } catch (e) { /* OPFS unsupported — nothing to clean */ }
+    }
+
+    // Keep the screen on during transfers — phones otherwise sleep and iOS
+    // suspends the page, killing the WebRTC connection mid-download.
+    async _acquireWakeLock() {
+        try {
+            if ('wakeLock' in navigator && !this.wakeLock) {
+                this.wakeLock = await navigator.wakeLock.request('screen');
+                this.wakeLock.addEventListener('release', () => { this.wakeLock = null; });
+            }
+        } catch (e) { /* not supported / denied — best effort */ }
+    }
+
+    _releaseWakeLock() {
+        if (this.wakeLock) {
+            this.wakeLock.release().catch(() => {});
+            this.wakeLock = null;
+        }
+    }
+
+    _createMemorySink(fileName) {
+        console.log('[DL] Buffering in memory (fallback mode)');
+        const chunks = [];
+        return {
+            mode: 'memory',
+            write: (chunk) => { chunks.push(chunk); },
+            close: async () => {
+                const blob = new Blob(chunks, { type: 'application/octet-stream' });
+                chunks.length = 0;
+                this.triggerDownload(blob, fileName);
+            },
+            abort: async () => { chunks.length = 0; },
+        };
+    }
+
+    _startSwKeepalive() {
+        if (this.swKeepaliveTimer) return;
+        // Regular messages keep the service worker alive during long transfers
+        this.swKeepaliveTimer = setInterval(() => {
+            const c = navigator.serviceWorker && navigator.serviceWorker.controller;
+            if (c) c.postMessage({ type: 'keepalive' });
+        }, 8000);
+    }
+
+    _maybeStopSwKeepalive() {
+        if (this.swKeepaliveTimer && !this.receiveState.active) {
+            clearInterval(this.swKeepaliveTimer);
+            this.swKeepaliveTimer = null;
+        }
+    }
+
+    // ── Receiving files ────────────────────────────────────────────────────
+
     async downloadFileP2P(fileId, fileName, fileSize) {
         const hostPeerId = this.currentTargetHostId;
         if (!hostPeerId) {
@@ -1206,83 +1691,181 @@ class LocalFileShare {
             return;
         }
 
-        // ── Step 1: Open save dialog NOW (requires user-gesture context) ──────
-        // showSaveFilePicker streams chunks directly to disk → no RAM accumulation.
-        // This must happen synchronously in the click handler before any awaits.
-        const hasStreamingSupport = 'showSaveFilePicker' in window;
-        const fileSizeMB = (fileSize || 0) / (1024 * 1024);
-
-        if (hasStreamingSupport) {
-            try {
-                const handle = await window.showSaveFilePicker({ suggestedName: fileName });
-                const writable = await handle.createWritable();
-                this.pendingWritables.set(fileId, { writable, writeQueue: Promise.resolve() });
-                console.log('[P2P] Save dialog accepted — will stream to disk');
-            } catch (e) {
-                if (e.name === 'AbortError') return; // user cancelled
-                // API unavailable in this context — fall back to in-memory
-                console.warn('[P2P] showSaveFilePicker failed, falling back to in-memory:', e.message);
-            }
-        } else if (fileSizeMB > 500) {
-            // Non-blocking warning — iOS/Android have no streaming API, large files may crash
-            this.showToast(
-                `${Math.round(fileSizeMB)} MB file — may be slow on mobile. Use a desktop browser for best results.`,
-                'warning'
-            );
+        if (this.receiveState.active) {
+            this.receiveState.queue.push({ fileId, fileName, fileSize });
+            this.showToast(`${fileName} queued — starts after the current download`, 'info');
+            return;
         }
 
-        // ── Step 2: Ensure P2P data channel is open ───────────────────────────
+        await this.startReceive(fileId, fileName, fileSize);
+    }
+
+    async startReceive(fileId, fileName, fileSize) {
+        const hostPeerId = this.currentTargetHostId;
+        const transferId = 't_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+        const transfer = {
+            transferId, fileId, fileName,
+            fileSize: fileSize || 0,
+            sink: null,
+            receivedBytes: 0,
+            writtenBytes: 0,
+            lastAckSent: 0,
+            lastUiUpdate: 0,
+            startTime: Date.now(),
+            writeChain: Promise.resolve(),
+            failed: false,
+            watchdog: null,
+            resuming: false,
+            resumeAttempts: 0,
+        };
+        this.receiveState.active = transfer; // reserve slot so new clicks queue up
+
         try {
-            let dataChannel = this.dataChannels.get(hostPeerId);
-            let pc = this.peerConnections.get(hostPeerId);
+            const dc = await this.ensureP2P(hostPeerId);
 
-            if (!dataChannel || dataChannel.readyState !== 'open') {
-                this.showToast('Establishing P2P connection...', 'info');
-
-                const needNew = !pc ||
-                    pc.connectionState === 'failed' ||
-                    pc.connectionState === 'closed' ||
-                    pc.connectionState === 'disconnected';
-
-                if (needNew) await this.initiateP2PConnection(hostPeerId);
-
-                let attempts = 0;
-                while (attempts < 20) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    pc = this.peerConnections.get(hostPeerId);
-                    dataChannel = this.dataChannels.get(hostPeerId);
-                    if (dataChannel && dataChannel.readyState === 'open') break;
-                    if (pc && pc.connectionState === 'failed' && attempts === 5) {
-                        pc.close();
-                        this.peerConnections.delete(hostPeerId);
-                        this.dataChannels.delete(hostPeerId);
-                        await this.initiateP2PConnection(hostPeerId);
-                    }
-                    attempts++;
+            // iPhone/Safari strategy:
+            //  ≤400 MB → service-worker streaming: direct write into the
+            //            browser's downloads (WebKit tolerates this size in RAM)
+            //  >400 MB → LAN relay → native URL download (WebKit buffers SW
+            //            streams, blob downloads and the share sheet in RAM,
+            //            so a plain network download is the only reliable path)
+            const isWebKit = /^Apple/i.test(navigator.vendor || '');
+            const WEBKIT_DIRECT_LIMIT = 400 * 1024 * 1024;
+            if (isWebKit && fileSize > WEBKIT_DIRECT_LIMIT) {
+                if (await this._relayAvailable(fileSize)) {
+                    transfer.mode = 'relay';
+                    dc.send(JSON.stringify({ type: 'relay-request', fileId, transferId }));
+                    this.preventUnloadDuringTransfer();
+                    this._acquireWakeLock();
+                    this.createProgressUI(transferId, fileName);
+                    this._resetWatchdog(transfer);
+                    this.showToast(`Preparing ${fileName} on the host…`, 'info');
+                    return;
                 }
-
-                if (!dataChannel || dataChannel.readyState !== 'open') {
-                    this.pendingWritables.delete(fileId); // cleanup on failure
-                    throw new Error('Could not establish P2P connection');
-                }
+                this.showToast('Files this large usually fail on iPhone without the local server (relay) running', 'warning');
             }
 
-            // ── Step 3: Request the file ───────────────────────────────────────
-            dataChannel.send(JSON.stringify({ type: 'file-request', fileId, fileName }));
+            transfer.sink = await this.createSink(transferId, fileName, fileSize);
+            dc.send(JSON.stringify({ type: 'file-request', fileId, transferId }));
+            this.preventUnloadDuringTransfer();
+            this._acquireWakeLock();
+            this.createProgressUI(transferId, fileName);
+            this._resetWatchdog(transfer);
             this.showToast(`Downloading ${fileName}…`, 'info');
-
         } catch (error) {
-            // Clean up any pending writable on error
-            const pending = this.pendingWritables.get(fileId);
-            if (pending) {
-                pending.writable.abort().catch(() => {});
-                this.pendingWritables.delete(fileId);
+            this.receiveState.active = null;
+            if (transfer.sink) transfer.sink.abort().catch(() => {});
+            if (error && error.name === 'AbortError') {
+                this._processReceiveQueue(); // user cancelled the save dialog
+                return;
             }
-            console.error('[P2P] Error downloading file:', error);
+            console.error('[P2P] Error starting download:', error);
             this.showToast(`Download failed: ${error.message}`, 'error');
+            this._processReceiveQueue();
         }
     }
-    
+
+    _resetWatchdog(transfer) {
+        if (transfer.watchdog) clearTimeout(transfer.watchdog);
+        transfer.watchdog = setTimeout(() => {
+            this._attemptResume(transfer, 'stalled — no data for 30s');
+        }, 30000);
+    }
+
+    // A dropped/stalled connection doesn't kill the download: reconnect with a
+    // fresh peer ID and ask the host to continue from the bytes already written.
+    async _attemptResume(transfer, reason) {
+        if (transfer.failed || transfer.resuming) return;
+        if (this.receiveState.active !== transfer) return;
+
+        transfer.resuming = true;
+        transfer.resumeAttempts++;
+        if (transfer.resumeAttempts > 5) {
+            transfer.resuming = false;
+            this.failReceive(transfer, new Error(`${reason} (gave up after 5 resume attempts)`));
+            return;
+        }
+
+        console.warn(`[P2P] Transfer interrupted (${reason}) — resuming from ` +
+            `${this.formatFileSize(transfer.writtenBytes)} (attempt ${transfer.resumeAttempts}/5)`);
+        this.showToast(`Connection hiccup — resuming ${transfer.fileName}…`, 'warning');
+        if (transfer.watchdog) clearTimeout(transfer.watchdog);
+
+        try {
+            // Kill the old channel first so no stale in-flight chunks get
+            // written after we pick the resume offset
+            this.teardownPeer(this.currentTargetHostId);
+            this.peerId = this.generatePeerId();
+
+            // Let queued sink writes settle — writtenBytes is then final
+            await transfer.writeChain.catch(() => {});
+            if (transfer.failed) return;
+
+            const dc = await this.ensureP2P(this.currentTargetHostId);
+            if (transfer.failed) return;
+
+            if (transfer.mode === 'relay') {
+                // Relay: just ask the host to stage the file again
+                dc.send(JSON.stringify({
+                    type: 'relay-request',
+                    fileId: transfer.fileId,
+                    transferId: transfer.transferId,
+                }));
+                this._resetWatchdog(transfer);
+                return;
+            }
+
+            // Bytes received but never written died with the old channel
+            transfer.receivedBytes = transfer.writtenBytes;
+            transfer.lastAckSent = transfer.writtenBytes;
+
+            dc.send(JSON.stringify({
+                type: 'file-request',
+                fileId: transfer.fileId,
+                transferId: transfer.transferId,
+                offset: transfer.writtenBytes,
+            }));
+            this._resetWatchdog(transfer);
+            console.log(`[P2P] Resume requested from ${this.formatFileSize(transfer.writtenBytes)}`);
+        } catch (e) {
+            this.failReceive(transfer, new Error('Could not reconnect to resume: ' + e.message));
+        } finally {
+            transfer.resuming = false;
+        }
+    }
+
+    failReceive(transfer, error) {
+        if (transfer.failed) return;
+        transfer.failed = true;
+        if (transfer.watchdog) clearTimeout(transfer.watchdog);
+        console.error(`[P2P] Transfer failed: ${transfer.fileName}:`, error);
+
+        if (transfer.sink) transfer.sink.abort().catch(() => {});
+
+        // Tell the host to stop sending
+        const dc = this.dataChannels.get(this.currentTargetHostId);
+        if (dc && dc.readyState === 'open') {
+            try { dc.send(JSON.stringify({ type: 'transfer-abort', transferId: transfer.transferId })); } catch (e) {}
+        }
+
+        this.showToast(`${transfer.fileName} failed: ${error.message}`, 'error');
+        this.removeProgressUI(transfer.transferId);
+
+        if (this.receiveState.active === transfer) {
+            this.receiveState.active = null;
+            this.allowUnload();
+            this._processReceiveQueue();
+        }
+    }
+
+    _processReceiveQueue() {
+        this._maybeStopSwKeepalive();
+        const next = this.receiveState.queue.shift();
+        if (next) this.startReceive(next.fileId, next.fileName, next.fileSize);
+        else this._releaseWakeLock();
+    }
+
     startKeepAlive(peerId) {
         // Stop any existing keep-alive for this peer
         this.stopKeepAlive(peerId);
@@ -1392,8 +1975,13 @@ class LocalFileShare {
                 console.error('[P2P] Error parsing control message:', error);
             }
         } else if (data instanceof Blob) {
-            // Safari sends Blob even when binaryType = 'arraybuffer'
-            data.arrayBuffer().then(buffer => this.handleFileChunk(peerId, buffer));
+            // Safari sends Blob even when binaryType = 'arraybuffer'.
+            // Serialize the async conversions — parallel arrayBuffer() calls can
+            // resolve out of order and corrupt the file.
+            this._blobChain = (this._blobChain || Promise.resolve())
+                .then(() => data.arrayBuffer())
+                .then(buffer => this.handleFileChunk(peerId, buffer))
+                .catch(err => console.error('[P2P] Blob chunk error:', err));
         } else {
             // ArrayBuffer (Chrome, Firefox)
             this.handleFileChunk(peerId, data);
@@ -1408,20 +1996,70 @@ class LocalFileShare {
 
         switch (message.type) {
             case 'file-request':
-                // Host receives file request from client
-                this.sendFileToClient(peerId, message.fileId);
+                // Host receives file request from client (offset > 0 = resume)
+                this.enqueueSend(peerId, message.fileId, message.transferId || message.fileId, message.offset || 0);
                 break;
-            case 'file-meta':
-                // Client receives file metadata
-                this.initializeFileReceive(peerId, message);
+            case 'relay-request':
+                // Host: stage the file on the LAN server for a WebKit receiver
+                this._handleRelayRequest(peerId, message);
                 break;
-            case 'file-chunk':
-                // Chunk metadata
+            case 'relay-progress': {
+                // Client: host reports its upload progress to the relay
+                const t = this.receiveState.active;
+                if (t && t.transferId === message.transferId && !t.failed) {
+                    this._resetWatchdog(t);
+                    const total = message.total || t.fileSize || 0;
+                    const pct = total ? Math.min(100, Math.round((message.uploaded / total) * 100)) : 0;
+                    const elapsed = (Date.now() - t.startTime) / 1000;
+                    const speed = message.uploaded / Math.max(elapsed, 0.001);
+                    const remaining = total ? (total - message.uploaded) / Math.max(speed, 1) : 0;
+                    this.updateProgressUI(t.transferId, pct, speed, remaining);
+                }
                 break;
+            }
+            case 'relay-ready':
+                // Client: file is staged — start the native browser download
+                this._completeRelayReceive(message);
+                break;
+            case 'file-meta': {
+                // Client: host confirmed the transfer — trust its size/type
+                const t = this.receiveState.active;
+                if (t && t.transferId === message.transferId) {
+                    t.fileSize = message.fileSize || t.fileSize;
+                    this._resetWatchdog(t);
+                }
+                break;
+            }
             case 'file-complete':
                 // Complete file transfer
                 this.completeFileReceive(peerId, message);
                 break;
+            case 'flow-ack': {
+                // Host: receiver reports how many bytes actually reached its sink
+                const st = this.sendStates.get(message.transferId);
+                if (st) {
+                    st.acked = message.received;
+                    if (st.ackWaiter) { const w = st.ackWaiter; st.ackWaiter = null; w(); }
+                }
+                break;
+            }
+            case 'transfer-abort': {
+                // Host: receiver gave up — stop the send loop
+                const st = this.sendStates.get(message.transferId);
+                if (st) {
+                    st.aborted = true;
+                    if (st.ackWaiter) { const w = st.ackWaiter; st.ackWaiter = null; w(); }
+                }
+                break;
+            }
+            case 'transfer-error': {
+                // Client: host couldn't serve the file
+                const t = this.receiveState.active;
+                if (t && t.transferId === message.transferId) {
+                    this.failReceive(t, new Error(message.error || 'Host reported an error'));
+                }
+                break;
+            }
             case 'ping':
                 // Respond to keep-alive ping with pong
                 this.sendPong(peerId, message.timestamp);
@@ -1448,213 +2086,362 @@ class LocalFileShare {
         }
     }
 
-    // Host sends file to client
-    async sendFileToClient(peerId, fileId) {
+    // ── LAN relay (WebKit receivers) ───────────────────────────────────────
+
+    _hostBase() {
+        if (!this.currentHostUrl) return '';
+        return this.currentHostUrl.endsWith('/') ? this.currentHostUrl.slice(0, -1) : this.currentHostUrl;
+    }
+
+    async _relayAvailable(fileSize) {
+        if (this._relayInfo === undefined) {
+            try {
+                const res = await fetch(`${this._hostBase()}/api/relay-info`);
+                this._relayInfo = res.ok ? await res.json() : null;
+            } catch (e) {
+                this._relayInfo = null; // cloud mode / old server — no relay
+            }
+        }
+        if (!this._relayInfo || !this._relayInfo.relay) return false;
+        if (fileSize && this._relayInfo.free && this._relayInfo.free < fileSize * 1.1) {
+            this.showToast('Server is low on disk space for relaying — using direct transfer', 'warning');
+            return false;
+        }
+        return true;
+    }
+
+    // Host: upload the file to the LAN server so the receiver can download it
+    // as a plain URL. XHR streams the File from disk and reports progress.
+    _handleRelayRequest(peerId, message) {
+        const { fileId, transferId } = message;
+        const dc = this.dataChannels.get(peerId);
+        const send = (obj) => {
+            if (dc && dc.readyState === 'open') {
+                try { dc.send(JSON.stringify(obj)); } catch (e) {}
+            }
+        };
+
+        const file = this.files.get(fileId);
+        if (!file) {
+            send({ type: 'transfer-error', transferId, error: 'File is no longer shared by the host' });
+            return;
+        }
+
+        console.log(`[Relay] Uploading ${file.name} (${this.formatFileSize(file.size)}) to the LAN server`);
+        const url = `/api/relay-upload/${encodeURIComponent(transferId)}?name=${encodeURIComponent(file.name)}`;
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url);
+
+        let lastProgress = 0;
+        xhr.upload.onprogress = (e) => {
+            const now = Date.now();
+            if (now - lastProgress > 500) {
+                lastProgress = now;
+                send({ type: 'relay-progress', transferId, uploaded: e.loaded, total: e.total || file.size });
+            }
+        };
+        xhr.onload = () => {
+            if (xhr.status === 200) {
+                console.log(`[Relay] Upload complete: ${file.name}`);
+                send({ type: 'relay-ready', transferId });
+            } else {
+                send({ type: 'transfer-error', transferId, error: `Relay upload failed (${xhr.status})` });
+            }
+        };
+        xhr.onerror = () => {
+            send({ type: 'transfer-error', transferId, error: 'Relay upload failed — is the server still running?' });
+        };
+        xhr.send(file);
+    }
+
+    // Client: staged file is ready — hand the URL to the browser's download
+    // manager. Network downloads stream to disk natively on every platform,
+    // iOS included, with progress in the browser's own downloads UI.
+    _completeRelayReceive(message) {
+        const transfer = this.receiveState.active;
+        if (!transfer || transfer.transferId !== message.transferId || transfer.failed) return;
+        if (transfer.watchdog) clearTimeout(transfer.watchdog);
+
+        const url = `${this._hostBase()}/api/relay-download/${encodeURIComponent(transfer.transferId)}`;
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = transfer.fileName;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 5000);
+
+        console.log(`[Relay] Native download started: ${url}`);
+        this._offerRelayCard(transfer.transferId, transfer.fileName, url);
+        this.showToast(`${transfer.fileName} — check your browser's downloads`, 'success');
+
+        this.receiveState.active = null;
+        this.allowUnload();
+        this._processReceiveQueue();
+    }
+
+    _offerRelayCard(transferId, fileName, url) {
+        const el = document.getElementById(`progress-${transferId}`);
+        if (!el) return;
+        el.innerHTML = `
+            <div class="progress-header">
+                <span class="progress-filename">${this._escapeHtml(fileName)}</span>
+                <span class="progress-percentage">✓</span>
+            </div>
+            <div class="progress-details"><span>Saving via your browser's downloads. Didn't start? Tap Download.</span></div>
+            <div style="display:flex; gap:10px; margin-top:10px;">
+                <a class="btn p2p-btn relay-retry-btn" href="${url}" download="${this._escapeHtml(fileName)}"
+                   style="text-decoration:none; padding:10px 20px; border-radius:6px; font-weight:600;">Download</a>
+                <button class="btn manual-save-dismiss" style="padding:10px 20px;">Done</button>
+            </div>
+        `;
+        el.querySelector('.manual-save-dismiss').addEventListener('click', () => this.removeProgressUI(transferId));
+        setTimeout(() => this.removeProgressUI(transferId), 15 * 60 * 1000);
+    }
+
+    // ── Sending files (host side) ──────────────────────────────────────────
+
+    enqueueSend(peerId, fileId, transferId, offset = 0) {
+        // A resume re-uses the transferId — stop any older send loop for it
+        // (its channel is usually dead, but don't rely on that)
+        const old = this.sendStates.get(transferId);
+        if (old) {
+            old.aborted = true;
+            if (old.ackWaiter) { const w = old.ackWaiter; old.ackWaiter = null; w(); }
+        }
+        const q = this.sendQueues.get(peerId) || [];
+        q.push({ fileId, transferId, offset });
+        this.sendQueues.set(peerId, q);
+        this._processSendQueue(peerId);
+    }
+
+    async _processSendQueue(peerId) {
+        if (this.sendActive.has(peerId)) return;
+        this.sendActive.add(peerId);
+        this._acquireWakeLock(); // host phone must not sleep mid-send
+        try {
+            const q = this.sendQueues.get(peerId);
+            while (q && q.length > 0) {
+                const item = q.shift();
+                try {
+                    await this.sendFileToClient(peerId, item.fileId, item.transferId, item.offset || 0);
+                } catch (e) {
+                    console.error('[P2P] Send failed:', e);
+                }
+            }
+        } finally {
+            this.sendActive.delete(peerId);
+            if (this.sendActive.size === 0) this._releaseWakeLock();
+        }
+    }
+
+    async sendFileToClient(peerId, fileId, transferId, startOffset = 0) {
+        const dataChannel = this.dataChannels.get(peerId);
+        if (!dataChannel || dataChannel.readyState !== 'open') {
+            console.error(`[P2P] No open data channel for peer: ${peerId}`);
+            return;
+        }
+
         const file = this.files.get(fileId);
         if (!file) {
             console.error(`[P2P] File not found: ${fileId}`);
+            dataChannel.send(JSON.stringify({
+                type: 'transfer-error', transferId,
+                error: 'File is no longer shared by the host',
+            }));
             return;
         }
 
-        const dataChannel = this.dataChannels.get(peerId);
-        if (!dataChannel) {
-            console.error(`[P2P] No data channel for peer: ${peerId}`);
-            return;
-        }
+        console.log(`[P2P] Sending ${file.name} (${this.formatFileSize(file.size)}) to ${peerId}` +
+            (startOffset ? ` — resuming from ${this.formatFileSize(startOffset)}` : ''));
 
-        console.log(`[P2P] Sending file ${file.name} to ${peerId}`);
-
-        // Send file metadata
         dataChannel.send(JSON.stringify({
             type: 'file-meta',
-            transferId: fileId,
+            transferId,
             fileName: file.name,
             fileSize: file.size,
             fileType: file.type,
-            chunkSize: 64 * 1024 // Reduced to 64KB chunks for better flow control
+            offset: startOffset,
         }));
 
-        // Read and send file in chunks with event-driven flow control
-        const chunkSize   = 64 * 1024;   // 64 KB per chunk
-        const BUFFER_HIGH = 512 * 1024;  // pause when buffered > 512 KB (Safari-safe)
-        const BUFFER_LOW  = 128 * 1024;  // resume when buffered drops to 128 KB
+        const CHUNK_SIZE  = 64 * 1024;        // safe max message size on all browsers
+        const BUFFER_HIGH = 4 * 1024 * 1024;  // pause when channel buffer exceeds this
+        const BUFFER_LOW  = 1 * 1024 * 1024;  // resume threshold
+        const MAX_UNACKED = 32 * 1024 * 1024; // never run further ahead of receiver's disk
 
-        // Use event-driven resume — no 100 ms polling delay
         dataChannel.bufferedAmountLowThreshold = BUFFER_LOW;
 
-        const reader = new FileReader();
-        let offset = 0;
-        let chunkIndex = 0;
-        let paused = false;
+        const state = { acked: startOffset, aborted: false, ackWaiter: null };
+        this.sendStates.set(transferId, state);
 
-        const sendNextChunk = () => {
-            if (paused) return;
+        let offset = startOffset;
+        let lastLog = startOffset;
+        try {
+            while (offset < file.size) {
+                if (state.aborted) {
+                    console.log(`[P2P] Transfer aborted by receiver: ${file.name}`);
+                    return;
+                }
+                if (dataChannel.readyState !== 'open') {
+                    throw new Error('Data channel closed during transfer');
+                }
 
-            if (offset >= file.size) {
-                dataChannel.send(JSON.stringify({
-                    type: 'file-complete',
-                    transferId: fileId
-                }));
-                console.log(`[P2P] File transfer complete: ${file.name}`);
-                return;
+                if (dataChannel.bufferedAmount > BUFFER_HIGH) {
+                    // Event-driven pause, with a timeout fallback for browsers
+                    // that don't fire bufferedamountlow reliably
+                    await new Promise((resolve) => {
+                        const t = setTimeout(resolve, 500);
+                        dataChannel.onbufferedamountlow = () => {
+                            clearTimeout(t);
+                            dataChannel.onbufferedamountlow = null;
+                            resolve();
+                        };
+                    });
+                    continue;
+                }
+
+                if (offset - state.acked > MAX_UNACKED) {
+                    // Receiver's disk is behind — wait for a flow-ack
+                    await new Promise((resolve, reject) => {
+                        const t = setTimeout(() => {
+                            state.ackWaiter = null;
+                            reject(new Error('Receiver stopped responding (no flow-ack for 60s)'));
+                        }, 60000);
+                        state.ackWaiter = () => { clearTimeout(t); resolve(); };
+                    });
+                    continue;
+                }
+
+                const buf = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
+                dataChannel.send(buf);
+                offset += buf.byteLength;
+
+                if (offset - lastLog >= 50 * 1024 * 1024) {
+                    lastLog = offset;
+                    console.log(`[P2P] Sending ${file.name}: ${Math.round((offset / file.size) * 100)}%`);
+                }
             }
 
-            if (dataChannel.bufferedAmount > BUFFER_HIGH) {
-                // Pause and wait for the buffer-low event instead of polling
-                paused = true;
-                dataChannel.onbufferedamountlow = () => {
-                    dataChannel.onbufferedamountlow = null;
-                    paused = false;
-                    sendNextChunk();
-                };
-                return;
-            }
-
-            const slice = file.slice(offset, offset + chunkSize);
-            reader.readAsArrayBuffer(slice);
-        };
-
-        reader.onload = (e) => {
+            dataChannel.send(JSON.stringify({ type: 'file-complete', transferId }));
+            console.log(`[P2P] File transfer complete: ${file.name}`);
+        } catch (err) {
+            console.error(`[P2P] Error sending ${file.name}:`, err);
             if (dataChannel.readyState === 'open') {
                 try {
-                    dataChannel.send(e.target.result);
-                    offset += e.target.result.byteLength;
-                    chunkIndex++;
-
-                    if (chunkIndex % 100 === 0) {
-                        const progress = Math.round((offset / file.size) * 100);
-                        console.log(`[P2P] Sending ${file.name}: ${progress}% (buffer: ${dataChannel.bufferedAmount} bytes)`);
-                    }
-
-                    sendNextChunk();
-                } catch (error) {
-                    console.error('[P2P] Error sending chunk:', error);
-                    setTimeout(() => sendNextChunk(), 50);
-                }
-            } else {
-                console.error('[P2P] Data channel closed during transfer');
+                    dataChannel.send(JSON.stringify({ type: 'transfer-error', transferId, error: err.message }));
+                } catch (e) {}
             }
-        };
-
-        reader.onerror = (error) => {
-            console.error('[P2P] Error reading file:', error);
-        };
-
-        sendNextChunk();
-    }
-
-    initializeFileReceive(peerId, meta) {
-        console.log(`[P2P] Receive starting: ${meta.fileName} (${this.formatFileSize(meta.fileSize)})`);
-
-        // Check if the user already opened a save dialog for this file
-        const pending = this.pendingWritables.get(meta.transferId);
-        if (pending) {
-            this.pendingWritables.delete(meta.transferId);
-            console.log('[P2P] Streaming mode: chunks go directly to disk');
+        } finally {
+            // A resume may have installed a newer state under the same id
+            if (this.sendStates.get(transferId) === state) {
+                this.sendStates.delete(transferId);
+            }
         }
-
-        this.transfers.set(meta.transferId, {
-            fileName:      meta.fileName,
-            fileSize:      meta.fileSize,
-            fileType:      meta.fileType,
-            chunks:        [],           // used only in fallback (non-streaming) mode
-            receivedBytes: 0,
-            startTime:     Date.now(),
-            // Streaming-to-disk state (showSaveFilePicker path)
-            streamMode:    !!pending,
-            writable:      pending ? pending.writable    : null,
-            writeQueue:    pending ? pending.writeQueue  : null,
-        });
-
-        this.preventUnloadDuringTransfer();
-        this.createProgressUI(meta.transferId, meta.fileName);
     }
-    
+
     preventUnloadDuringTransfer() {
         // Add beforeunload handler to prevent accidental navigation
         if (!this.unloadHandler) {
             this.unloadHandler = (e) => {
-                if (this.transfers.size > 0) {
+                if (this.receiveState.active) {
                     const message = 'Download in progress! Are you sure you want to leave?';
                     e.preventDefault();
                     e.returnValue = message;
-                    console.log('[P2P] 🚨 Prevented page unload during transfer');
                     return message;
                 }
             };
             window.addEventListener('beforeunload', this.unloadHandler);
-            console.log('[P2P] 🔒 Page unload protection enabled');
         }
     }
-    
+
     allowUnload() {
         // Remove beforeunload handler when no transfers are active
-        if (this.unloadHandler && this.transfers.size === 0) {
+        if (this.unloadHandler && !this.receiveState.active) {
             window.removeEventListener('beforeunload', this.unloadHandler);
             this.unloadHandler = null;
-            console.log('[P2P] 🔓 Page unload protection disabled');
         }
     }
 
     handleFileChunk(peerId, chunk) {
-        for (const [transferId, transfer] of this.transfers.entries()) {
-            if (transfer.receivedBytes < transfer.fileSize) {
-                transfer.receivedBytes += chunk.byteLength;
+        const transfer = this.receiveState.active;
+        if (!transfer || transfer.failed || !transfer.sink) return;
 
-                if (transfer.streamMode && transfer.writable) {
-                    // Chain writes to preserve order without blocking this handler
-                    transfer.writeQueue = transfer.writeQueue.then(() =>
-                        transfer.writable.write(chunk)
-                    );
-                } else {
-                    transfer.chunks.push(chunk);
+        const len = chunk.byteLength;
+        transfer.receivedBytes += len;
+        this._resetWatchdog(transfer);
+
+        // Chain sink writes to preserve order; ack the sender only after the
+        // sink actually accepted the bytes (end-to-end backpressure).
+        transfer.writeChain = transfer.writeChain
+            .then(() => transfer.sink.write(chunk))
+            .then(() => {
+                transfer.writtenBytes += len;
+                if (transfer.writtenBytes - transfer.lastAckSent >= 1024 * 1024 ||
+                    transfer.writtenBytes >= transfer.fileSize) {
+                    transfer.lastAckSent = transfer.writtenBytes;
+                    const dc = this.dataChannels.get(peerId);
+                    if (dc && dc.readyState === 'open') {
+                        dc.send(JSON.stringify({
+                            type: 'flow-ack',
+                            transferId: transfer.transferId,
+                            received: transfer.writtenBytes,
+                        }));
+                    }
                 }
+            })
+            .catch((err) => this.failReceive(transfer, err));
 
-                const progress  = Math.round((transfer.receivedBytes / transfer.fileSize) * 100);
-                const elapsed   = (Date.now() - transfer.startTime) / 1000;
-                const speed     = transfer.receivedBytes / elapsed;
-                const remaining = (transfer.fileSize - transfer.receivedBytes) / speed;
-                this.updateProgressUI(transferId, progress, speed, remaining);
-                break;
-            }
+        // Throttle progress UI updates — per-chunk DOM writes hurt on mobile
+        const now = Date.now();
+        if (now - transfer.lastUiUpdate > 250 || transfer.receivedBytes >= transfer.fileSize) {
+            transfer.lastUiUpdate = now;
+            const progress = transfer.fileSize
+                ? Math.min(100, Math.round((transfer.receivedBytes / transfer.fileSize) * 100))
+                : 0;
+            const elapsed = (now - transfer.startTime) / 1000;
+            const speed = transfer.receivedBytes / Math.max(elapsed, 0.001);
+            const remaining = (transfer.fileSize - transfer.receivedBytes) / Math.max(speed, 1);
+            this.updateProgressUI(transfer.transferId, progress, speed, remaining);
         }
     }
 
     async completeFileReceive(peerId, message) {
-        const transfer = this.transfers.get(message.transferId);
-        if (!transfer) {
-            console.error('[P2P] Transfer not found');
-            return;
-        }
-
-        console.log(`[P2P] Transfer complete: ${transfer.fileName} (${this.formatFileSize(transfer.receivedBytes)})`);
+        const transfer = this.receiveState.active;
+        if (!transfer || transfer.transferId !== message.transferId || transfer.failed) return;
+        if (transfer.watchdog) clearTimeout(transfer.watchdog);
 
         try {
-            if (transfer.streamMode && transfer.writable) {
-                // Wait for all queued disk writes to finish, then close the file
-                await transfer.writeQueue;
-                await transfer.writable.close();
-                this.showToast(`${transfer.fileName} saved!`, 'success');
-            } else {
-                // Fallback: assemble Blob from in-memory chunks and trigger download
-                const blob = new Blob(transfer.chunks, {
-                    type: transfer.fileType || 'application/octet-stream'
-                });
-                transfer.chunks = []; // free chunk memory before creating URL
-                this.triggerDownload(blob, transfer.fileName);
-                this.showToast(`${transfer.fileName} downloaded!`, 'success');
+            // Safari path: wait for pending Blob→ArrayBuffer conversions first,
+            // then for every queued sink write, then finalize the file.
+            await (this._blobChain || Promise.resolve());
+            await transfer.writeChain;
+            if (transfer.failed) return; // a write error already handled this transfer
+            if (transfer.fileSize && transfer.receivedBytes !== transfer.fileSize) {
+                throw new Error(`Incomplete: got ${this.formatFileSize(transfer.receivedBytes)} of ${this.formatFileSize(transfer.fileSize)}`);
             }
+            const closeResult = await transfer.sink.close();
 
-            setTimeout(() => this.removeProgressUI(message.transferId), 1000);
+            console.log(`[P2P] Transfer complete: ${transfer.fileName} (${this.formatFileSize(transfer.receivedBytes)})`);
+            if (closeResult === 'manual-save-offered') {
+                // OPFS path: the card now shows save buttons — leave it up
+                this.showToast(`${transfer.fileName} received — save it from the card below`, 'success');
+            } else {
+                this.showToast(`${transfer.fileName} saved!`, 'success');
+                this.updateProgressUI(transfer.transferId, 100, transfer.receivedBytes / Math.max((Date.now() - transfer.startTime) / 1000, 0.001), 0);
+                setTimeout(() => this.removeProgressUI(transfer.transferId), 1500);
+            }
         } catch (error) {
             console.error('[P2P] Error completing file receive:', error);
             this.showToast(`Error saving ${transfer.fileName}: ${error.message}`, 'error');
-            this.removeProgressUI(message.transferId);
+            this.removeProgressUI(transfer.transferId);
         } finally {
-            setTimeout(() => {
-                this.transfers.delete(message.transferId);
+            // Only clear if this transfer is still the active one — failReceive
+            // may have already moved on to the next queued download
+            if (this.receiveState.active === transfer) {
+                this.receiveState.active = null;
                 this.allowUnload();
-            }, 2000);
+                this._processReceiveQueue();
+            }
         }
     }
 
@@ -1683,7 +2470,7 @@ class LocalFileShare {
         progressContainer.className = 'download-progress';
         progressContainer.innerHTML = `
             <div class="progress-header">
-                <span class="progress-filename">${fileName}</span>
+                <span class="progress-filename">${this._escapeHtml(fileName)}</span>
                 <span class="progress-percentage">0%</span>
             </div>
             <div class="progress-bar-container">
